@@ -1,34 +1,85 @@
-# Gradle files
-.gradle/
-build/
+# ==========================================
+# 1. 过滤所有路径下的图片文件
+# ==========================================
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.bmp
+*.tiff
+*.ico
+*.svg
+*.heic
+*.raw
 
-# Local configuration file (sdk path, etc)
-local.properties
+# ==========================================
+# 2. 过滤所有路径下的 AI / 模型文件
+# ==========================================
+*.onnx
+*.pb
+*.pth
+*.pt
+*.safetensors
+*.bin
+*.h5
+*.tflite
+*.ckpt
+*.ptl
+*.engine
 
-# Log/OS Files
-*.log
+# ==========================================
+# 3. 过滤机密、密钥与环境变量文件
+# ==========================================
+# 环境变量与配置
+.env
+.env.*
+!.env.example
+!.env.template
+config.json
+secrets.yaml
+secrets.json
 
-# Android Studio generated files and folders
-captures/
-.externalNativeBuild/
-.cxx/
-*.aab
-*.apk
-output-metadata.json
-
-# IntelliJ
-*.iml
-.idea/
-misc.xml
-deploymentTargetDropDown.xml
-render.experimental.xml
-
-# Keystore files
-*.jks
+# 私钥与证书
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
 *.keystore
+id_rsa
+id_rsa.pub
 
-# Google Services (e.g. APIs or Firebase)
-google-services.json
+# 密码与凭据文件
+credentials.json
+auth.json
+*.pcap
 
-# Android Profiling
-*.hprof
+# ==========================================
+# 4. 过滤数据库与本地缓存/数据库文件
+# ==========================================
+*.sqlite
+*.sqlite3
+*.db
+*.s3db
+
+# ==========================================
+# 5. 常见系统与编辑器垃圾文件
+# ==========================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# IDEs / 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
