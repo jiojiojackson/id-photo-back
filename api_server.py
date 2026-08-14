@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import Response
 from hivision.creator import IDCreator
 from hivision.creator.human_matting import extract_human_birefnet_lite
@@ -19,16 +19,10 @@ creator = IDCreator()
 creator.matting_handler = extract_human_birefnet_lite
 creator.detection_handler = detect_face_retinaface
 
-# The inference lock guarantees that the GPU/model is used by only one job at a time.
+# The worker is deliberately single-threaded: one queue job at a time.
 inference_lock = threading.Lock()
 worker_lock = threading.Lock()
 worker_running = False
-
-
-def _check_worker_key(api_key: str | None) -> None:
-    expected = os.getenv("LIGHTNING_API_KEY")
-    if not expected or api_key != expected:
-        raise HTTPException(status_code=401, detail="Invalid API key")
 
 
 def _run_inference(data: bytes, width: int, height: int) -> tuple[bytes, float]:
@@ -47,7 +41,6 @@ def _run_inference(data: bytes, width: int, height: int) -> tuple[bytes, float]:
         raise ValueError(f"Invalid image: {exc}") from exc
 
     start_time = time.perf_counter()
-    # This lock is intentional: do not run multiple IDCreator jobs concurrently.
     with inference_lock:
         result = creator(image_bgr, size=(height, width), face_alignment=False)
     elapsed = time.perf_counter() - start_time
@@ -108,35 +101,23 @@ async def generate(
     )
 
 
-# Lightning receives only the Vercel bridge URL in the request body. The shared
-# LIGHTNING_API_KEY is reused in-memory to authenticate calls back to Vercel.
-# No R2 credentials are ever stored or transmitted to Lightning.
-
 def _process_jobs(bridge_url: str, max_jobs: int | None) -> None:
+    """Drain the Vercel queue strictly serially, then stop immediately."""
     global worker_running
     processed = 0
     try:
         import requests
 
         bridge_url = bridge_url.rstrip("/")
-        bridge_token = os.getenv("LIGHTNING_API_KEY")
-        if not bridge_token:
-            raise RuntimeError("LIGHTNING_API_KEY is not configured")
-        headers = {
-            "Authorization": f"Bearer {bridge_token}",
-            "Accept": "application/json",
-        }
 
         while max_jobs is None or processed < max_jobs:
             response = requests.get(
                 f"{bridge_url}/api/worker/next",
-                headers=headers,
                 timeout=30,
             )
             if response.status_code == 204:
                 requests.post(
                     f"{bridge_url}/api/worker/finish",
-                    headers={**headers, "Content-Type": "application/json"},
                     json={"processed": processed},
                     timeout=30,
                 ).raise_for_status()
@@ -156,14 +137,13 @@ def _process_jobs(bridge_url: str, max_jobs: int | None) -> None:
             try:
                 requests.post(
                     f"{bridge_url}/api/worker/job/{job_id}/start",
-                    headers=headers,
                     timeout=30,
                 ).raise_for_status()
 
                 input_response = requests.get(job["inputUrl"], timeout=60)
                 input_response.raise_for_status()
 
-                # _run_inference contains an explicit lock, so jobs are always serial.
+                # _run_inference contains an explicit lock; only one job can use the model.
                 output, _ = _run_inference(
                     input_response.content,
                     int(job.get("width", 295)),
@@ -180,7 +160,6 @@ def _process_jobs(bridge_url: str, max_jobs: int | None) -> None:
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
                 requests.post(
                     f"{bridge_url}/api/worker/job/{job_id}",
-                    headers={**headers, "Content-Type": "application/json"},
                     json={"status": "completed", "processingTimeMs": elapsed_ms},
                     timeout=30,
                 ).raise_for_status()
@@ -191,7 +170,6 @@ def _process_jobs(bridge_url: str, max_jobs: int | None) -> None:
                 try:
                     requests.post(
                         f"{bridge_url}/api/worker/job/{job_id}",
-                        headers={**headers, "Content-Type": "application/json"},
                         json={
                             "status": "failed",
                             "error": str(exc)[:2000],
@@ -212,12 +190,8 @@ def _process_jobs(bridge_url: str, max_jobs: int | None) -> None:
 
 
 @app.post("/process-queue")
-def process_queue(
-    payload: dict,
-    x_api_key: str | None = Header(default=None),
-):
-    _check_worker_key(x_api_key)
-
+def process_queue(payload: dict):
+    """Wake the serial queue worker; platform-level access is outside the app."""
     bridge_url = str(payload.get("bridgeUrl", "")).strip()
     if not bridge_url or not bridge_url.startswith(("https://", "http://")):
         raise HTTPException(status_code=400, detail="Valid bridgeUrl is required")
@@ -234,7 +208,7 @@ def process_queue(
     global worker_running
     with worker_lock:
         if worker_running:
-            return {"status": "already_running"}
+            return {"status": "already_running", "mode": "serial"}
         worker_running = True
         thread = threading.Thread(
             target=_process_jobs,
