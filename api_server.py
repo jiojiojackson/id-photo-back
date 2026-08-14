@@ -191,7 +191,13 @@ def _process_jobs(bridge_url: str, max_jobs: int | None) -> None:
 
 @app.post("/process-queue")
 def process_queue(payload: dict):
-    """Wake the serial queue worker; platform-level access is outside the app."""
+    """Wake the serial queue worker.
+
+    Authentication/authorization for this endpoint is intentionally handled by
+    the Lightning platform. The application does not read, validate, or store
+    LIGHTNING_API_KEY. Vercel supplies the platform-issued key when it calls
+    this endpoint.
+    """
     bridge_url = str(payload.get("bridgeUrl", "")).strip()
     if not bridge_url or not bridge_url.startswith(("https://", "http://")):
         raise HTTPException(status_code=400, detail="Valid bridgeUrl is required")
