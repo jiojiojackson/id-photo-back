@@ -3,6 +3,7 @@ from fastapi.responses import Response
 from hivision.creator import IDCreator
 from hivision.creator.human_matting import extract_human_birefnet_lite
 from hivision.creator.face_detector import detect_face_retinaface
+from PIL import Image
 
 import cv2
 import io
@@ -103,9 +104,10 @@ async def generate(
     )
 
 
-# Queue processing is intentionally started asynchronously. The Vercel API remains
-# responsible for queue state and for generating short-lived R2 presigned URLs.
-# Lightning only receives a bridge URL/token in this request and never needs R2 keys.
+# Queue processing is intentionally asynchronous. Vercel remains responsible for
+# queue state and for generating short-lived R2 presigned URLs. Lightning only
+# receives a bridge URL/token in memory and never needs R2 credentials.
+
 
 def _process_jobs(bridge_url: str, bridge_token: str, max_jobs: int | None) -> None:
     global worker_running
