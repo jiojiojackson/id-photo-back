@@ -155,16 +155,26 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
 
         bridge_url = bridge_url.rstrip("/")
         headers = _bridge_headers(worker_credential)
+        next_url = f"{bridge_url}/api/worker/next"
+        print(
+            f"[QueueWorker] started run={worker_run_id} "
+            f"bridge={bridge_url} credential_length={len(worker_credential)}"
+        )
 
         while max_jobs is None or processed < max_jobs:
             response = requests.post(
-                f"{bridge_url}/api/worker/next",
+                next_url,
                 headers=headers,
                 json={},
                 timeout=REQUEST_TIMEOUT_SECONDS,
             )
 
             if response.status_code == 401:
+                response_body = response.text[:1000]
+                print(
+                    f"[QueueWorker] /next unauthorized run={worker_run_id} "
+                    f"status=401 body={response_body!r}"
+                )
                 raise RuntimeError("worker credential is invalid or expired")
             response.raise_for_status()
             payload = response.json()
@@ -264,17 +274,7 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
         print(f"[QueueWorker] stopped run={worker_run_id} processed={processed}")
 
 
-@app.post("/process-queue")
-def process_queue(payload: dict):
-    """Wake a stateless Lightning Worker Run.
-
-    Vercel authenticates this request at the Lightning platform level with its
-    platform-issued API key. The application deliberately has no Lightning,
-    R2, Database, or Queue project credentials in its environment.
-
-    The short-lived Worker Credential is supplied only in this request body and
-    is then used as a Bearer credential when calling the Vercel Bridge.
-    """
+def _process_queue_payload(payload: dict) -> dict:
     # The wake payload uses snake_case because it is the stable Vercel →
     # Lightning contract. Accept camelCase as a backwards-compatible alias.
     bridge_url = str(payload.get("bridge_url", payload.get("bridgeUrl", ""))).strip().rstrip("/")
@@ -297,14 +297,32 @@ def process_queue(payload: dict):
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="max_jobs must be a positive integer")
 
+    return {
+        "bridge_url": bridge_url,
+        "worker_run_id": worker_run_id,
+        "worker_credential": worker_credential,
+        "max_jobs": max_jobs,
+    }
+
+
+@app.post("/process-queue")
+def process_queue(payload: dict):
+    """Wake a stateless Lightning Worker Run."""
+    parsed = _process_queue_payload(payload)
+
     global worker_running
     with worker_lock:
         if worker_running:
-            return {"status": "already_running", "mode": "serial", "worker_run_id": worker_run_id}
+            return {"status": "already_running", "mode": "serial", "worker_run_id": parsed["worker_run_id"]}
         worker_running = True
         thread = threading.Thread(
             target=_process_jobs,
-            args=(bridge_url, worker_run_id, worker_credential, max_jobs),
+            args=(
+                parsed["bridge_url"],
+                parsed["worker_run_id"],
+                parsed["worker_credential"],
+                parsed["max_jobs"],
+            ),
             name="id-photo-queue-worker",
             daemon=True,
         )
@@ -313,5 +331,5 @@ def process_queue(payload: dict):
     return {
         "status": "started",
         "mode": "serial",
-        "worker_run_id": worker_run_id,
+        "worker_run_id": parsed["worker_run_id"],
     }
