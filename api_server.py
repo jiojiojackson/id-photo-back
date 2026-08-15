@@ -142,8 +142,6 @@ def _heartbeat_loop(bridge_url: str, worker_credential: str, job_id: str, stop_e
                 return
             response.raise_for_status()
         except Exception as exc:
-            # A transient heartbeat failure must not kill inference. The next
-            # heartbeat can recover the lease while it is still valid.
             print(f"[QueueWorker] heartbeat failed job={job_id}: {exc}")
 
 
@@ -277,30 +275,32 @@ def process_queue(payload: dict):
     The short-lived Worker Credential is supplied only in this request body and
     is then used as a Bearer credential when calling the Vercel Bridge.
     """
-    bridge_url = str(payload.get("bridgeUrl", "")).strip().rstrip("/")
-    worker_run_id = str(payload.get("workerRunId", "")).strip()
-    worker_credential = str(payload.get("workerCredential", "")).strip()
+    # The wake payload uses snake_case because it is the stable Vercel →
+    # Lightning contract. Accept camelCase as a backwards-compatible alias.
+    bridge_url = str(payload.get("bridge_url", payload.get("bridgeUrl", ""))).strip().rstrip("/")
+    worker_run_id = str(payload.get("worker_run_id", payload.get("workerRunId", ""))).strip()
+    worker_credential = str(payload.get("worker_credential", payload.get("workerCredential", ""))).strip()
 
     if not bridge_url or not bridge_url.startswith(("https://", "http://")):
-        raise HTTPException(status_code=400, detail="Valid bridgeUrl is required")
+        raise HTTPException(status_code=400, detail="Valid bridge_url is required")
     if not worker_run_id:
-        raise HTTPException(status_code=400, detail="workerRunId is required")
+        raise HTTPException(status_code=400, detail="worker_run_id is required")
     if len(worker_credential) < 32:
-        raise HTTPException(status_code=400, detail="workerCredential is required")
+        raise HTTPException(status_code=400, detail="worker_credential is required")
 
-    max_jobs = payload.get("maxJobs")
+    max_jobs = payload.get("max_jobs", payload.get("maxJobs"))
     if max_jobs is not None:
         try:
             max_jobs = int(max_jobs)
             if max_jobs < 1:
                 raise ValueError
         except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="maxJobs must be a positive integer")
+            raise HTTPException(status_code=400, detail="max_jobs must be a positive integer")
 
     global worker_running
     with worker_lock:
         if worker_running:
-            return {"status": "already_running", "mode": "serial", "workerRunId": worker_run_id}
+            return {"status": "already_running", "mode": "serial", "worker_run_id": worker_run_id}
         worker_running = True
         thread = threading.Thread(
             target=_process_jobs,
@@ -313,5 +313,5 @@ def process_queue(payload: dict):
     return {
         "status": "started",
         "mode": "serial",
-        "workerRunId": worker_run_id,
+        "worker_run_id": worker_run_id,
     }
