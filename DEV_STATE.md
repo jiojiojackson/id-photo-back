@@ -99,19 +99,6 @@ pillow
 
 Docker 不再安装 `requirements-app.txt`，因此不会为了 Worker 引入 Gradio。
 
-原 Dockerfile 中：
-
-```text
-pip install -r requirements.txt -r requirements-app.txt
-pip install "fastapi[standard]" python-multipart pillow
-```
-
-存在重复安装和不必要的 UI 依赖，现已改为：
-
-```text
-pip install -r requirements.txt -r requirements-worker.txt
-```
-
 ## Docker 启动方式
 
 正式单容器启动：
@@ -134,6 +121,41 @@ api_server:app
 ```
 
 `docker-compose.yml` 不参与 Production，不需要修改。
+
+## Docker 首次启动问题与修复
+
+第一次使用新的 Production Docker Image 启动时，容器在导入 `api_server.py` 阶段失败：
+
+```text
+ModuleNotFoundError: No module named 'gradio'
+```
+
+原因不是 Worker API 使用 Gradio，而是旧的 `hivision/plugin/beauty/grind_skin.py` 同时承担了旧 Gradio Demo/UI 代码和 `grindSkin()` 推理函数。`hivision` 包初始化会导入 `BeautyTools → grind_skin`，因此即使 Production Worker 不启动 Gradio UI，Python import 仍然要求安装 Gradio。
+
+正确处理方式不是把整个 Gradio 再装回 Production Image，而是移除 Production 推理路径不需要的 Gradio runtime dependency：
+
+- `grind_skin.py` 保留 `grindSkin()` 核心图像处理函数。
+- 删除该文件中的 `import gradio as gr`。
+- 删除旧的 Gradio demo/UI 构建代码和 `iface.launch()`。
+- `requirements-worker.txt` 继续保持无 Gradio。
+
+修复提交：
+
+```text
+ d26367661aac9783bcda51f88b7a9bedcd21be27
+```
+
+这样 Production Worker 可以继续使用 `BeautyTools → grindSkin()`，但不会因为旧 Demo 代码强制安装 Gradio。
+
+### ONNX Runtime GPU warning
+
+Docker 启动时可能看到：
+
+```text
+[W:onnxruntime] GPU device discovery failed ... /sys/class/drm/card0/device/vendor
+```
+
+当前项目明确使用 CPU Execution Provider，因此该信息是 ONNX Runtime 在无 GPU 容器环境中的 warning，不是导致 FastAPI 启动失败的原因。
 
 ## 环境变量边界
 
@@ -286,15 +308,17 @@ finish
 3. Dockerfile 去除重复 FastAPI / multipart / pillow 安装。
 4. 新增 `requirements-worker.txt`，将 Production Worker Web/API 依赖与模型依赖分开。
 5. Dockerfile 不再安装 `requirements-app.txt`，避免引入 Gradio。
-6. 保持单容器 `uvicorn api_server:app --host 0.0.0.0 --port 8000`。
-7. 不修改 `docker-compose.yml`，因为 Production 不使用它。
-8. 不修改 Worker Bridge 和推理业务逻辑。
+6. 发现旧 `grind_skin.py` 的 Gradio UI import 会在 Production import 阶段强制依赖 Gradio。
+7. 已从 `grind_skin.py` 移除 Gradio import 和旧 UI，仅保留 Production 使用的 `grindSkin()`。
+8. 保持单容器 `uvicorn api_server:app --host 0.0.0.0 --port 8000`。
+9. 不修改 `docker-compose.yml`，因为 Production 不使用它。
+10. 不修改 Worker Bridge 和推理业务逻辑。
 
 ## 当前待验证
 
-1. 在本地/CI 执行 Docker build。
+1. 重新执行 Docker build。
 2. 确认 `.onnx` 文件全部进入 image。
-3. 确认容器可以启动 FastAPI / Uvicorn。
+3. 确认容器可以启动 FastAPI / Uvicorn，且不再出现 `ModuleNotFoundError: gradio`。
 4. 确认 `/process-queue` 可以被 Lightning Platform 正常调用。
 5. 重新执行完整 3 Job Worker Run。
 6. 检查 Job cleanup / Worker Run end RSS 日志。
@@ -311,4 +335,5 @@ Docker packaging commits：
 44135e2e828be6b01be495d1a08971ea57c0352b  # .dockerignore
 cdd75d15ddff6caddea687a836f4bfc932c7b0aa  # requirements-worker.txt
 df5818a81fcb590c2acc156c180c985e48bca7f5  # Dockerfile
+d26367661aac9783bcda51f88b7a9bedcd21be27  # remove Gradio runtime dependency
 ```
