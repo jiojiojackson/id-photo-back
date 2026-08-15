@@ -30,6 +30,69 @@ DOWNLOAD_TIMEOUT_SECONDS = 60
 UPLOAD_TIMEOUT_SECONDS = 120
 
 
+def _set_worker_model_cache(enabled: bool) -> None:
+    """Keep Hivision ONNX sessions alive for exactly one queue Worker Run.
+
+    Hivision's model handlers use module-level ONNX Runtime sessions and the
+    RUN_MODE=beast switch to retain them between calls. We deliberately scope
+    that mode to the Worker Run instead of enabling it for the whole API
+    process, so an idle/stateless worker does not retain the ~6 GB model set.
+    """
+    os.environ["RUN_MODE"] = "beast" if enabled else "normal"
+
+
+def _clear_worker_model_cache() -> None:
+    """Release Hivision's cached ONNX sessions after a Worker Run.
+
+    The upstream handlers keep sessions in module globals. Clearing these
+    references at Worker Run end gives us the intended lifecycle:
+
+        worker starts -> load once -> reuse for all jobs -> worker ends -> free
+
+    This is intentionally done only after the queue is empty or the run stops;
+    it must not happen between individual jobs.
+    """
+    try:
+        import hivision.creator.human_matting as human_matting
+        human_matting.BIREFNET_V1_LITE_SESS = None
+        human_matting.RMBG_SESS = None
+        human_matting.HIVISION_MODNET_SESS = None
+        human_matting.MODNET_PHOTOGRAPHIC_PORTRAIT_MATTING_SESS = None
+    except Exception as exc:
+        print(f"[QueueWorker] failed to clear human-matting model cache: {exc}", flush=True)
+
+    try:
+        import hivision.creator.face_detector as face_detector
+        face_detector.RETINAFCE_SESS = None
+    except Exception as exc:
+        print(f"[QueueWorker] failed to clear RetinaFace model cache: {exc}", flush=True)
+
+
+def _prepare_worker_models(worker_run_id: str) -> None:
+    """Enter Worker Run model-cache mode without eagerly loading the models.
+
+    Models remain lazy-loaded by Hivision on the first job. The important
+    invariant is that RUN_MODE stays `beast` for the entire run, so subsequent
+    jobs reuse the same BiRefNet/RetinaFace ONNX sessions.
+    """
+    _set_worker_model_cache(True)
+    print(
+        f"[QueueWorker] model cache enabled run={worker_run_id} "
+        "scope=worker_run reuse=enabled",
+        flush=True,
+    )
+
+
+def _finish_worker_models(worker_run_id: str) -> None:
+    _clear_worker_model_cache()
+    _set_worker_model_cache(False)
+    print(
+        f"[QueueWorker] model cache cleared run={worker_run_id} "
+        "scope=worker_run",
+        flush=True,
+    )
+
+
 def _run_inference(data: bytes, width: int, height: int) -> tuple[bytes, float]:
     if width < 100 or width > 3000:
         raise ValueError("width must be between 100 and 3000 pixels")
@@ -170,6 +233,7 @@ def _heartbeat_loop(bridge_url: str, worker_credential: str, job_id: str, stop_e
 def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, max_jobs: int | None) -> None:
     global worker_running
     processed = 0
+    _prepare_worker_models(worker_run_id)
 
     try:
         import requests
@@ -178,7 +242,6 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
         headers = _bridge_headers(worker_credential)
         next_url = f"{bridge_url}/next"
         finish_url = f"{bridge_url}/finish"
-        _log_bridge_request("POST", next_url, worker_run_id, "next")
         print(
             f"[QueueWorker] started run={worker_run_id} "
             f"bridge={bridge_url} credential_length={len(worker_credential)}",
@@ -304,6 +367,7 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
     except Exception as exc:
         print(f"[QueueWorker] stopped unexpectedly run={worker_run_id}: {exc}", flush=True)
     finally:
+        _finish_worker_models(worker_run_id)
         with worker_lock:
             worker_running = False
         print(f"[QueueWorker] stopped run={worker_run_id} processed={processed}", flush=True)
