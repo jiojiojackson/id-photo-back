@@ -1,0 +1,49 @@
+# Git / repository metadata
+.git
+.github
+.gitignore
+
+# Python cache / local environments
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+ENV/
+
+# Build / packaging artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Local logs / temporary files
+*.log
+*.tmp
+*.temp
+/tmp/
+/tmp_test/
+
+# Development / documentation files not needed at runtime
+docs/
+demo/
+*.md
+DEV_STATE.md
+plan.md
+
+# Docker / local orchestration files
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# Local editor / OS files
+.DS_Store
+.idea/
+.vscode/

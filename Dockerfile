@@ -13,11 +13,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY requirements.txt requirements-app.txt ./
+COPY requirements.txt requirements-worker.txt ./
 
 RUN pip install --upgrade pip && \
-    pip install -r requirements.txt -r requirements-app.txt && \
-    pip install "fastapi[standard]" python-multipart pillow
+    pip install -r requirements.txt -r requirements-worker.txt
 
 COPY . /app/HivisionIDPhotos
 
