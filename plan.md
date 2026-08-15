@@ -81,7 +81,68 @@ RUN_MODE=normal
 
 这样可以避免模型在长期空闲进程中持续占用大量内存。
 
-## 4. 预期性能变化
+## 4. 每 Job 临时内存生命周期
+
+模型复用解决的是 ONNX session 的重复加载，但 Job 之间还有大量短生命周期对象：
+
+```text
+R2 response
+ ↓
+input bytes
+ ↓
+PIL Image
+ ↓
+NumPy RGB/BGR
+ ↓
+IDCreator result / OpenCV output
+ ↓
+PNG encoded bytes
+ ↓
+R2 upload response
+```
+
+这些对象不能跨 Job 保留。
+
+后端现在在每 Job 的推理、上传、callback 完成后显式：
+
+```text
+Response.close()
+del input_data / output
+job = None
+payload = None
+heartbeat thread/event = None
+gc.collect()
+libc.malloc_trim(0)  # Linux/glibc best effort
+```
+
+同时 `_run_inference()` 在 `finally` 中释放 PIL / NumPy / OpenCV / IDCreator 临时引用。
+
+**不在这里释放 ONNX session**，因为 BiRefNet / RetinaFace 属于 Worker Run 缓存。
+
+### RSS 诊断
+
+不新增 `psutil` 依赖，直接读取 Linux：
+
+```text
+/proc/self/status → VmRSS
+```
+
+记录：
+
+```text
+memory label=job_complete rss_mb=...
+memory label=job_cleanup rss_mb=...
+memory label=worker_run_end rss_mb=...
+```
+
+目的不是假设一定存在内存泄漏，而是区分：
+
+1. Python 临时对象未释放。
+2. CPython/glibc allocator 保留已释放 heap。
+3. ONNX Runtime arena/session 保留内存。
+4. 真正的跨 Job 引用泄漏。
+
+## 5. 预期性能变化
 
 此前 3 Job 测试中每个 Job 都重新加载 BiRefNet：
 
@@ -97,7 +158,7 @@ Job 3: Loading ONNX model ≈ 2.5s
 
 新的 Worker Run 重新加载一次是预期行为，因为这是 Worker Run 级生命周期，而不是进程级常驻。
 
-## 5. Queue Worker
+## 6. Queue Worker
 
 Worker 严格串行：
 
@@ -115,7 +176,7 @@ next
 
 `inference_lock` 继续保留，避免同步 `/generate` 与 Queue Worker 同时执行模型推理。
 
-## 6. Vercel Bridge
+## 7. Vercel Bridge
 
 ```text
 POST /api/worker/next
@@ -133,7 +194,7 @@ Authorization: Bearer <short-lived-worker-credential>
 
 不使用 Lightning API Key 访问 Vercel Bridge。
 
-## 7. 动态 Preview Hostname
+## 8. 动态 Preview Hostname
 
 禁止硬编码 Vercel hostname。
 
@@ -155,7 +216,7 @@ https://<current-preview-host>/api/worker
 
 分别追加到 `/api/worker` 基础 URL。
 
-## 8. 错误分类
+## 9. 错误分类
 
 Vercel 返回 401 时区分：
 
@@ -169,7 +230,7 @@ Unauthorized
 
 避免把 Deployment Protection 错误误报成 Worker Credential 过期。
 
-## 9. 当前调试方式
+## 10. 当前调试方式
 
 当前运行在 Lightning Studio Linux，不使用 Docker：
 
@@ -180,7 +241,7 @@ python3 -m uvicorn api_server:app --host 0.0.0.0 --port 8000
 
 Debug 模式不需要 Lightning API Key。
 
-## 10. 验证计划
+## 11. 验证计划
 
 ### 模型缓存
 
@@ -192,6 +253,21 @@ Debug 模式不需要 Lightning API Key。
 4. RetinaFace 也应复用同一 session。
 5. finish 后应出现 `model cache cleared`。
 6. 下一次新的 Worker Run 应重新加载一次。
+
+### 每 Job 内存
+
+提交至少 3～5 个 Job，观察：
+
+```text
+memory label=job_complete rss_mb=...
+memory label=job_cleanup rss_mb=...
+```
+
+重点比较 Job 1 → Job 2 → Job 3 的 `job_cleanup` RSS。
+
+- 如果 `job_cleanup` 后基本稳定：临时对象已被清理。
+- 如果 `job_cleanup` 后仍逐 Job 增长：继续检查 ONNX Runtime arena、Hivision 内部缓存以及真正的引用泄漏。
+- 不应因为 RSS 没有立刻下降就直接判断为泄漏；glibc/ONNX Runtime 可能保留可复用内存。
 
 ### 完整链路
 
@@ -222,10 +298,11 @@ finish
 - 多 Worker Run 并发保护
 - Lightning Platform Wake 模式
 
-## 11. 正式生产前
+## 12. 正式生产前
 
 1. 保持模型为 CPU Execution Provider。
 2. 根据真实内存峰值评估 Lightning Instance 内存规格。
 3. 根据真实 Job 数量调整 Worker Run 最大处理时长。
 4. 验证 Worker Run 结束后模型引用确实释放。
-5. 再切换到 Lightning Platform serverless / inference API。
+5. 验证每 Job 临时内存不会无限增长。
+6. 再切换到 Lightning Platform serverless / inference API。
