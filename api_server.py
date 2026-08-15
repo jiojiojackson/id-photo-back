@@ -19,12 +19,10 @@ creator = IDCreator()
 creator.matting_handler = extract_human_birefnet_lite
 creator.detection_handler = detect_face_retinaface
 
-# One Lightning container owns one Worker Run. Model inference is always serial.
 inference_lock = threading.Lock()
 worker_lock = threading.Lock()
 worker_running = False
 
-# The Vercel bridge starts with a 10-minute lease. Heartbeat extends it by 10 minutes.
 HEARTBEAT_INTERVAL_SECONDS = 60
 REQUEST_TIMEOUT_SECONDS = 30
 DOWNLOAD_TIMEOUT_SECONDS = 60
@@ -122,31 +120,40 @@ def _bridge_headers(worker_credential: str) -> dict[str, str]:
     }
 
 
-def _heartbeat_loop(bridge_url: str, worker_credential: str, job_id: str, stop_event: threading.Event) -> None:
-    """Keep the current Job lease alive while GPU inference is running."""
+def _log_bridge_request(method: str, url: str, run_id: str, stage: str) -> None:
+    """Log the complete Vercel Bridge URL, including hostname, without logging secrets."""
+    print(
+        f"[QueueWorker] Vercel request stage={stage} method={method} "
+        f"url={url} run={run_id}",
+        flush=True,
+    )
+
+
+def _heartbeat_loop(bridge_url: str, worker_credential: str, job_id: str, stop_event: threading.Event, worker_run_id: str) -> None:
     import requests
 
+    url = f"{bridge_url}/api/worker/heartbeat"
     while not stop_event.wait(HEARTBEAT_INTERVAL_SECONDS):
+        _log_bridge_request("POST", url, worker_run_id, "heartbeat")
         try:
             response = requests.post(
-                f"{bridge_url}/api/worker/heartbeat",
+                url,
                 headers=_bridge_headers(worker_credential),
                 json={"jobId": job_id},
                 timeout=REQUEST_TIMEOUT_SECONDS,
             )
             if response.status_code == 401:
-                print(f"[QueueWorker] heartbeat unauthorized job={job_id}")
+                print(f"[QueueWorker] heartbeat unauthorized job={job_id}", flush=True)
                 return
             if response.status_code == 409:
-                print(f"[QueueWorker] heartbeat lease expired job={job_id}")
+                print(f"[QueueWorker] heartbeat lease expired job={job_id}", flush=True)
                 return
             response.raise_for_status()
         except Exception as exc:
-            print(f"[QueueWorker] heartbeat failed job={job_id}: {exc}")
+            print(f"[QueueWorker] heartbeat failed job={job_id}: {exc}", flush=True)
 
 
 def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, max_jobs: int | None) -> None:
-    """Drain the Vercel bridge strictly serially, then finish the Worker Run."""
     global worker_running
     processed = 0
 
@@ -156,12 +163,16 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
         bridge_url = bridge_url.rstrip("/")
         headers = _bridge_headers(worker_credential)
         next_url = f"{bridge_url}/api/worker/next"
+        finish_url = f"{bridge_url}/api/worker/finish"
+        _log_bridge_request("POST", next_url, worker_run_id, "next")
         print(
             f"[QueueWorker] started run={worker_run_id} "
-            f"bridge={bridge_url} credential_length={len(worker_credential)}"
+            f"bridge={bridge_url} credential_length={len(worker_credential)}",
+            flush=True,
         )
 
         while max_jobs is None or processed < max_jobs:
+            _log_bridge_request("POST", next_url, worker_run_id, "next")
             response = requests.post(
                 next_url,
                 headers=headers,
@@ -173,7 +184,8 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
                 response_body = response.text[:1000]
                 print(
                     f"[QueueWorker] /next unauthorized run={worker_run_id} "
-                    f"status=401 body={response_body!r}"
+                    f"status=401 body={response_body!r}",
+                    flush=True,
                 )
                 raise RuntimeError("worker credential is invalid or expired")
             response.raise_for_status()
@@ -181,14 +193,15 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
             status = payload.get("status")
 
             if status == "empty":
+                _log_bridge_request("POST", finish_url, worker_run_id, "finish")
                 finish = requests.post(
-                    f"{bridge_url}/api/worker/finish",
+                    finish_url,
                     headers=headers,
                     json={"processed": processed},
                     timeout=REQUEST_TIMEOUT_SECONDS,
                 )
                 finish.raise_for_status()
-                print(f"[QueueWorker] queue empty, worker finished processed={processed}")
+                print(f"[QueueWorker] queue empty, worker finished processed={processed}", flush=True)
                 break
 
             if status != "job" or not payload.get("job"):
@@ -200,7 +213,7 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
             heartbeat_stop = threading.Event()
             heartbeat_thread = threading.Thread(
                 target=_heartbeat_loop,
-                args=(bridge_url, worker_credential, job_id, heartbeat_stop),
+                args=(bridge_url, worker_credential, job_id, heartbeat_stop, worker_run_id),
                 name=f"heartbeat-{job_id}",
                 daemon=True,
             )
@@ -227,8 +240,10 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
                 ).raise_for_status()
 
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
+                complete_url = f"{bridge_url}/api/worker/complete"
+                _log_bridge_request("POST", complete_url, worker_run_id, "complete")
                 complete = requests.post(
-                    f"{bridge_url}/api/worker/complete",
+                    complete_url,
                     headers=headers,
                     json={
                         "jobId": job_id,
@@ -241,14 +256,17 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
                 processed += 1
                 print(
                     f"[QueueWorker] completed job={job_id} "
-                    f"total={elapsed_ms}ms inference={inference_elapsed:.3f}s"
+                    f"total={elapsed_ms}ms inference={inference_elapsed:.3f}s",
+                    flush=True,
                 )
 
             except Exception as exc:
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
+                fail_url = f"{bridge_url}/api/worker/fail"
+                _log_bridge_request("POST", fail_url, worker_run_id, "fail")
                 try:
                     failed = requests.post(
-                        f"{bridge_url}/api/worker/fail",
+                        fail_url,
                         headers=headers,
                         json={
                             "jobId": job_id,
@@ -259,24 +277,22 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
                     )
                     failed.raise_for_status()
                 except Exception as callback_error:
-                    print(f"[QueueWorker] fail callback failed job={job_id}: {callback_error}")
+                    print(f"[QueueWorker] fail callback failed job={job_id}: {callback_error}", flush=True)
                 processed += 1
-                print(f"[QueueWorker] failed job={job_id} time={elapsed_ms}ms error={exc}")
+                print(f"[QueueWorker] failed job={job_id} time={elapsed_ms}ms error={exc}", flush=True)
             finally:
                 heartbeat_stop.set()
                 heartbeat_thread.join(timeout=2)
 
     except Exception as exc:
-        print(f"[QueueWorker] stopped unexpectedly run={worker_run_id}: {exc}")
+        print(f"[QueueWorker] stopped unexpectedly run={worker_run_id}: {exc}", flush=True)
     finally:
         with worker_lock:
             worker_running = False
-        print(f"[QueueWorker] stopped run={worker_run_id} processed={processed}")
+        print(f"[QueueWorker] stopped run={worker_run_id} processed={processed}", flush=True)
 
 
 def _process_queue_payload(payload: dict) -> dict:
-    # The wake payload uses snake_case because it is the stable Vercel →
-    # Lightning contract. Accept camelCase as a backwards-compatible alias.
     bridge_url = str(payload.get("bridge_url", payload.get("bridgeUrl", ""))).strip().rstrip("/")
     worker_run_id = str(payload.get("worker_run_id", payload.get("workerRunId", ""))).strip()
     worker_credential = str(payload.get("worker_credential", payload.get("workerCredential", ""))).strip()
