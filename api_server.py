@@ -135,6 +135,26 @@ def _finish_worker_models(worker_run_id: str) -> None:
     )
 
 
+def _shutdown_worker_process(worker_run_id: str, processed: int) -> None:
+    """Terminate the API process after the Worker Run ends.
+
+    This container is intentionally a single-use Lightning Worker Run. Uvicorn
+    stays alive after the background queue thread finishes unless the process
+    is explicitly terminated. Exiting here lets the container runtime observe
+    process termination and scale the Lightning instance back to zero.
+
+    Model/session cleanup has already completed before this function is called.
+    `os._exit(0)` is intentional: raising SystemExit inside the worker thread
+    would only terminate that thread and leave Uvicorn running.
+    """
+    print(
+        f"[QueueWorker] exiting process for scale-to-zero "
+        f"run={worker_run_id} processed={processed}",
+        flush=True,
+    )
+    os._exit(0)
+
+
 def _run_inference(data: bytes, width: int, height: int) -> tuple[bytes, float]:
     if width < 100 or width > 3000:
         raise ValueError("width must be between 100 and 3000 pixels")
@@ -419,6 +439,7 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
         with worker_lock:
             worker_running = False
         print(f"[QueueWorker] stopped run={worker_run_id} processed={processed}", flush=True)
+        _shutdown_worker_process(worker_run_id, processed)
 
 
 def _process_queue_payload(payload: dict) -> dict:
@@ -471,7 +492,7 @@ def _process_queue_payload(payload: dict) -> dict:
 
 @app.post("/process-queue")
 def process_queue(payload: dict, request: Request):
-    """Wake a stateless Lightning Worker Run."""
+    """Wake a single-use, stateless Lightning Worker Run."""
     parsed = _process_queue_payload(payload)
 
     forwarded_host = request.headers.get("x-forwarded-host")
