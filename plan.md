@@ -230,18 +230,109 @@ Unauthorized
 
 避免把 Deployment Protection 错误误报成 Worker Credential 过期。
 
-## 10. 当前调试方式
+## 10. Production Docker
 
-当前运行在 Lightning Studio Linux，不使用 Docker：
+正式部署使用**单个 Docker Container**，不使用 `docker-compose.yml`。
+
+启动入口：
 
 ```bash
-cd /path/to/id-photo-back
-python3 -m uvicorn api_server:app --host 0.0.0.0 --port 8000
+uvicorn api_server:app --host 0.0.0.0 --port 8000
 ```
 
-Debug 模式不需要 Lightning API Key。
+Docker Production 依赖分为：
 
-## 11. 验证计划
+```text
+requirements.txt
+    ↓
+模型/推理依赖
+
+requirements-worker.txt
+    ↓
+fastapi
+uvicorn[standard]
+python-multipart
+pillow
+```
+
+Docker 不安装 `requirements-app.txt`，因为该文件包含旧 Gradio UI 依赖，Production Worker 不需要 Gradio。
+
+### Gradio 依赖修复
+
+Production Worker 导入 `hivision` 时会经过：
+
+```text
+hivision.creator
+ ↓
+hivision.plugin.beauty
+ ↓
+BeautyTools
+ ↓
+grind_skin.py
+```
+
+旧版 `grind_skin.py` 同时包含 Gradio Demo，并在模块导入阶段执行：
+
+```python
+import gradio as gr
+```
+
+导致不安装 Gradio 的 Production Docker 在启动阶段出现：
+
+```text
+ModuleNotFoundError: No module named 'gradio'
+```
+
+正确方案：保留 `grindSkin()` Production 推理函数，移除 `gradio` import、旧 UI `Blocks`、按钮和 `iface.launch()`。这样不需要为了 Worker 安装 Gradio。
+
+修复提交：
+
+```text
+d26367661aac9783bcda51f88b7a9bedcd21be27
+```
+
+### 模型文件
+
+`.onnx` 模型文件直接存放在 Git 仓库中，必须进入 Docker image；`.dockerignore` 不排除 `*.onnx`。
+
+### Docker 忽略规则
+
+`.dockerignore` 排除 Git metadata、Python cache、虚拟环境、build artifacts、docs/demo、Markdown、日志、IDE/OS 文件和 `docker-compose.yml`，但保留 `.onnx`。
+
+## 11. 当前调试方式
+
+本地 Docker 验证：
+
+```bash
+docker build -t id-photo-back .
+docker run --rm -p 8000:8000 id-photo-back
+```
+
+启动后检查：
+
+```text
+0.0.0.0:8000
+```
+
+当前 Docker 首次启动曾出现：
+
+```text
+ModuleNotFoundError: No module named 'gradio'
+```
+
+该问题已经通过移除 `grind_skin.py` 中的旧 Gradio UI 依赖解决。
+
+另外可能看到 ONNX Runtime 的 GPU discovery warning；由于当前使用 CPU Execution Provider，该 warning 不属于启动失败原因。
+
+## 12. 验证计划
+
+### Docker 启动
+
+1. 重新执行 Docker build。
+2. 确认 `.onnx` 文件全部进入 image。
+3. 确认容器启动时不再出现 `ModuleNotFoundError: gradio`。
+4. 确认 FastAPI / Uvicorn 监听 `0.0.0.0:8000`。
+5. 确认 `/process-queue` 可以正常接受 Lightning Platform 请求。
 
 ### 模型缓存
 
@@ -298,11 +389,12 @@ finish
 - 多 Worker Run 并发保护
 - Lightning Platform Wake 模式
 
-## 12. 正式生产前
+## 13. 正式生产前
 
 1. 保持模型为 CPU Execution Provider。
 2. 根据真实内存峰值评估 Lightning Instance 内存规格。
 3. 根据真实 Job 数量调整 Worker Run 最大处理时长。
 4. 验证 Worker Run 结束后模型引用确实释放。
 5. 验证每 Job 临时内存不会无限增长。
-6. 再切换到 Lightning Platform serverless / inference API。
+6. 验证 Production Docker image 能启动并运行 `/process-queue`。
+7. 再切换到 Lightning Platform serverless / inference API。
