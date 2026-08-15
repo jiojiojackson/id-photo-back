@@ -2,11 +2,11 @@
 
 当前开发分支：`agent/queue-worker-bridge`
 
-本仓库是证件照 GPU 推理后端，对应前端 `id-photo-front` 的 Vercel + Neon + R2 + Vercel Queue 架构。
+本仓库是证件照 CPU 推理后端，对应前端 `id-photo-front` 的 Vercel + Neon + R2 + Vercel Queue 架构。
 
 ## 当前目标
 
-Lightning 作为无状态 GPU Worker：
+Lightning 作为无状态 Worker：
 
 1. Vercel 用户点击“开始处理”后创建 `worker_run` 和短期 Worker Credential。
 2. 生产模式：Vercel 使用平台提供的 `LIGHTNING_API_URL` / `LIGHTNING_API_KEY` 唤醒 Lightning。
@@ -16,7 +16,61 @@ Lightning 作为无状态 GPU Worker：
 6. `/api/worker/next` claim Job 后才返回 R2 input/output presigned URL。
 7. 推理期间每 60 秒 heartbeat，初始 lease 为 10 分钟。
 8. 成功调用 `/api/worker/complete`；失败调用 `/api/worker/fail`。
-9. `/api/worker/next` 返回 `empty` 后调用 `/api/worker/finish`，Worker Run 结束。
+9. `/api/worker/next` 返回 `empty` 后调用 `/api/worker/finish`，Worker Run 结束并释放模型。
+
+## 模型生命周期：Worker Run 级复用
+
+2026-08-15 联调发现：原代码虽然在模块级只创建了一个 `IDCreator`，但 Hivision 的 `extract_human_birefnet_lite` 和 RetinaFace handler 会根据 `RUN_MODE` 管理模块级 ONNX Runtime session。之前未进入 `beast` 模式，因此每个 Job 都重新加载 ONNX 模型。
+
+现在 `api_server.py` 在 Worker Run 开始时：
+
+```text
+RUN_MODE=beast
+```
+
+模型仍然采用 lazy load：第一个 Job 第一次调用时加载 BiRefNet / RetinaFace。
+
+之后同一个 Worker Run 的 Job 2、Job 3、... 复用已经存在的 ONNX Runtime session，不再重复加载。
+
+Worker Run 结束时：
+
+```text
+1. 清空 hivision.creator.human_matting 的 ONNX session 引用
+2. 清空 hivision.creator.face_detector.RETINAFCE_SESS
+3. RUN_MODE 恢复为 normal
+```
+
+因此生命周期为：
+
+```text
+Worker Run 开始
+    ↓
+RUN_MODE=beast
+    ↓
+Job 1 → 第一次加载模型
+    ↓
+Job 2 → 复用模型
+    ↓
+Job 3 → 复用模型
+    ↓
+queue empty / worker error
+    ↓
+清理 ONNX sessions
+    ↓
+RUN_MODE=normal
+```
+
+这不是长期进程级模型常驻；模型只在当前 Worker Run 的处理窗口内保持。
+
+### CPU 模式
+
+本项目明确使用 CPU 推理，不切换 GPU，也不为了优化 GPU 增加依赖或配置。
+
+BiRefNet + RetinaFace 本身内存占用较高，因此本方案重点是：
+
+- 同一 Worker Run 内避免重复加载。
+- Worker Run 结束主动释放模型引用。
+- Lightning 空闲时不需要通过代码保持模型常驻。
 
 ## 已完成
 
@@ -30,75 +84,60 @@ Lightning 作为无状态 GPU Worker：
 - `/api/worker/complete` 完成 Job。
 - `/api/worker/fail` 失败 Job，并由 Vercel 根据 `MAX_ATTEMPTS=5` 决定重新排队或最终失败。
 - `/api/worker/finish` 结束 Worker Run。
-- 每个 Job 只启动一个 heartbeat 线程；GPU inference 本身仍由 `inference_lock` 严格串行。
+- 每个 Job 只启动一个 heartbeat 线程；CPU inference 本身仍由 `inference_lock` 严格串行。
 - 输出使用 Job 返回的 R2 presigned PUT URL 写入 PNG。
 - 单个 Job 失败不会停止整个 Worker Run；会回调 fail 后继续处理下一个 Job。
 - Lightning Worker 会在调用 Vercel Bridge 前输出完整请求 URL，包括协议、主机名、端口和路径；不会输出 Worker Credential。
+- 修复 `bridge_url + /api/worker/*` 重复拼接问题。
+- 区分 Vercel Deployment Protection 401 与 Worker Credential 401。
+- 修复前端 middleware 对 `/api/worker/*` 的浏览器 Cookie 认证拦截（由前端仓库完成）。
+- 实测成功完成 3 Job 串行 Worker Run。
+- 模型改为 Worker Run 级缓存：同一 Run 内 BiRefNet / RetinaFace 只加载一次，Run 结束主动清理。
 
-## 2026-08-15 最新联合调试发现
+## 2026-08-15 联合调试结果
 
-收到日志：
-
-```text
-bridge_url=https://<preview-host>/api/worker
-Vercel request ... url=https://<preview-host>/api/worker/api/worker/next
-```
-
-确认后端之前错误地把已经包含 `/api/worker` 的 `bridge_url` 再次拼接 `/api/worker/*`，造成：
+已验证完整链路：
 
 ```text
-/api/worker/api/worker/next
+Vercel
+ ↓
+/process-queue
+ ↓
+Lightning Worker
+ ↓
+/api/worker/next
+ ↓
+claim Job
+ ↓
+R2 input
+ ↓
+CPU BiRefNet + RetinaFace
+ ↓
+R2 output
+ ↓
+/api/worker/complete
+ ↓
+next
+ ↓
+next
+ ↓
+finish
 ```
 
-现已修复为：
+此前一次 3 Job 测试：
 
 ```text
-bridge_url=https://<preview-host>/api/worker
-next=https://<preview-host>/api/worker/next
-heartbeat=https://<preview-host>/api/worker/heartbeat
-complete=https://<preview-host>/api/worker/complete
-fail=https://<preview-host>/api/worker/fail
-finish=https://<preview-host>/api/worker/finish
+Job 1 total=21759ms inference=20.410s
+Job 2 total=22953ms inference=21.770s
+Job 3 total=19940ms inference=19.006s
+processed=3
 ```
 
-因此 `bridge_url` 的语义现在明确为 **`/api/worker` 基础 URL**，各操作只追加 `/next`、`/heartbeat` 等最后一级 path。
+日志中每个 Job 都出现 `Loading ONNX model took ...`，确认存在重复加载。
 
-### 第二个问题：Vercel Deployment Protection
-
-修复 path 后，上一轮日志同时确认：
-
-```text
-401 Protected deployment
-vercel_auth_enabled=true
-```
-
-这意味着 Lightning 请求在到达 Next.js `/api/worker/next` Route Handler 之前，就被 Vercel Preview Deployment Protection 拦截。
-
-因此此前：
-
-```text
-401 → worker credential is invalid or expired
-```
-
-的诊断是不准确的。该 401 实际可能来自 Vercel Deployment Protection，而不是 Worker Credential。
-
-后端现已解析 Vercel 401 response：
-
-```text
-reason=vercel_deployment_protection
-```
-
-或：
-
-```text
-reason=worker_credential_rejected
-```
-
-并分别输出不同错误信息。
+本次代码已针对该问题修复。下一次 3 Job 测试应该只在 Worker Run 第一次实际推理时看到 ONNX model loading；Job 2/3 不应再次出现该日志。
 
 ## 当前调试方案：Lightning Studio Linux 直接运行
-
-调试阶段：
 
 ```text
 Vercel
@@ -118,7 +157,7 @@ Lightning Studio Linux
 
 ## Vercel Bridge URL
 
-Worker 现在打印：
+Worker 打印：
 
 ```text
 POST https://<preview-host>/api/worker/next
@@ -129,19 +168,6 @@ POST https://<preview-host>/api/worker/finish
 ```
 
 不会打印 Credential。
-
-## Vercel Preview Protection 待处理
-
-当前调试 Preview 开启了 Vercel Deployment Protection。Lightning Studio 没有 Vercel SSO Cookie，因此不能直接访问受保护 Preview 的 `/api/worker/*`。
-
-目标架构仍然是：
-
-```text
-普通 Preview 页面 → Vercel Deployment Protection
-/api/worker/* → 使用短期 Worker Credential 自己认证
-```
-
-因此下一步需要在 Vercel 侧为 Debug Preview 解决 Deployment Protection 对 Worker Bridge 的拦截。不要通过给 Lightning 传递用户 SSO Cookie 的方式解决。
 
 ## 启动服务
 
@@ -165,23 +191,27 @@ python3 -m uvicorn api_server:app --host 0.0.0.0 --port 8000
 
 ## 当前待验证
 
-1. Vercel Debug Preview 解除/绕过 Deployment Protection 对 `/api/worker/*` 的拦截。
-2. 重新启动 Lightning Worker。
-3. 日志确认：
+1. 重启 Lightning Studio FastAPI，使最新模型缓存代码生效。
+2. 提交 3 个 Job。
+3. 点击开始处理。
+4. 确认 Worker Run 首个 Job 出现一次：
 
 ```text
-POST https://<preview-host>/api/worker/next
+Loading ONNX model took ...
 ```
 
-而不是 `/api/worker/api/worker/next`。
+5. 确认 Job 2、Job 3 不再出现该日志。
+6. 确认 3 Job 均成功 complete。
+7. 确认 finish 后日志出现：
 
-4. 确认 `/next` 返回 200，而不是 Vercel Protected deployment 401。
-5. 如果仍为 401，确认日志中的 `reason` 是 `worker_credential_rejected` 后再检查 Credential。
-6. 完成 1 Job：claim → R2 input → inference → R2 output → complete。
-7. 再完成 3 Job 串行测试。
-8. heartbeat、Worker 崩溃、lease recovery、重复 complete、fail-retry、credential expiry。
-9. 调试链路稳定后，再切回 Lightning 平台 Wake 模式。
+```text
+[QueueWorker] model cache cleared run=...
+```
+
+8. 下一次新的 Worker Run 应重新加载模型一次；这是刻意设计的 Worker Run 生命周期，不是进程级常驻。
+9. heartbeat、Worker 崩溃、lease recovery、重复 complete、fail-retry、credential expiry。
+10. 调试链路稳定后，再切回 Lightning 平台 Wake 模式。
 
 ## 当前提交
 
-后端最新 commit：`e6e550c681ef3809e31a6909e32066c06d0dc8bd`。
+后端最新 commit：`f7fddd24ad7515615a9854339546cc7a648e2f24`。
