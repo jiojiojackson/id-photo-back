@@ -32,7 +32,62 @@ replica 1 → 0
 
 一个 Worker Run 完成后不代表 Uvicorn/FastAPI 服务应该退出。Deployment 的 replica 生命周期由 Lightning 平台管理。
 
-## 2. Lightning Deployment 当前配置
+## 2. Production ASGI Entry Point 与 Health
+
+正式 Docker 不再直接以 `api_server:app` 作为 Uvicorn target，而是：
+
+```text
+uvicorn app_entry:app --host 0.0.0.0 --port 8000
+```
+
+`app_entry.py` 导入原有 `api_server.app`，只增加两个平台元数据端点：
+
+```text
+GET /
+GET /health
+```
+
+### `GET /`
+
+返回：
+
+```text
+service
+version
+status
+worker_running
+endpoints
+```
+
+### `GET /health`
+
+返回：
+
+```text
+status=healthy
+service
+version
+worker_running
+started_at
+checked_at
+```
+
+这两个端点必须满足：
+
+```text
+HTTP 200
+JSON
+轻量
+不访问 Vercel
+不访问 Queue
+不启动 Worker
+不加载 ONNX 模型
+不修改 Job 状态
+```
+
+目的：为 Lightning / Docker / 反向代理提供稳定的 liveness/metadata endpoint，避免 `/` 与 `/health` 返回 404 被平台误判为服务异常。
+
+## 3. Lightning Deployment 当前配置
 
 已确认当前 Deployment：
 
@@ -70,7 +125,9 @@ Lightning Autoscaler
 replica = 0
 ```
 
-## 3. 不允许应用主动退出 Deployment
+`/health` 请求只提供轻量服务状态，不应该启动 Worker；如果 Lightning 平台把健康检查作为 activity，其行为需要通过实际 Deployment 验证。
+
+## 4. 不允许应用主动退出 Deployment
 
 此前为了让 Container 停止，加入过：
 
@@ -110,7 +167,7 @@ worker stopped log
 
 **Uvicorn 主进程继续运行。**
 
-## 4. Worker Run 模型生命周期
+## 5. Worker Run 模型生命周期
 
 ### 开始
 
@@ -148,7 +205,7 @@ Worker thread stopped
 
 不退出 Uvicorn。
 
-## 5. 每 Job 内存生命周期
+## 6. 每 Job 内存生命周期
 
 每 Job：
 
@@ -182,7 +239,7 @@ worker_run_end RSS
 
 ONNX session 不在 Job 之间释放，只在 Worker Run 结束时释放。
 
-## 6. Queue Worker
+## 7. Queue Worker
 
 Worker 严格串行：
 
@@ -208,7 +265,7 @@ worker_running = false
 
 不会启动任何新的后台 Worker。
 
-## 7. Worker Bridge
+## 8. Worker Bridge
 
 保持：
 
@@ -228,7 +285,7 @@ Authorization: Bearer <short-lived-worker-credential>
 
 不使用 Lightning API Key。
 
-## 8. 动态 Vercel Host
+## 9. 动态 Vercel Host
 
 `vercel_origin` 是当前 Vercel 请求对应的实际 Preview/Production host。
 
@@ -250,14 +307,14 @@ https://<vercel-origin>/api/worker
 
 禁止硬编码 Vercel hostname。
 
-## 9. Production Docker
+## 10. Production Docker
 
 使用单个 Dockerfile，不使用 `docker-compose.yml`。
 
 启动：
 
 ```bash
-uvicorn api_server:app --host 0.0.0.0 --port 8000
+uvicorn app_entry:app --host 0.0.0.0 --port 8000
 ```
 
 依赖：
@@ -281,13 +338,13 @@ Gradio 是现有 beauty plugin import chain 的 runtime dependency，但不会�
 
 `.onnx` 模型文件直接包含在 Docker image；`.dockerignore` 不排除 `.onnx`。
 
-## 10. CPU 推理
+## 11. CPU 推理
 
 当前明确使用 CPU Execution Provider。
 
 不增加 GPU 专用依赖。
 
-## 11. 错误处理
+## 12. 错误处理
 
 Worker 401 分类：
 
@@ -303,11 +360,11 @@ Worker Credential invalid/expired
 
 Worker Run 本身异常时仍清理模型并结束 Worker thread；不主动结束 Uvicorn。
 
-## 12. Scale-to-zero 验证计划
+## 13. Scale-to-zero 验证计划
 
 ### 第一次测试
 
-1. 发布撤销 `os._exit(0)` 后的新 Docker image。
+1. 发布当前 Docker image，确保包含 `app_entry.py` 和新的 root/health endpoints。
 2. Lightning Deployment 保持：
 
 ```text
@@ -317,8 +374,16 @@ CPU >= 95
 idle timeout = 300s
 ```
 
-3. 创建 3 个 Job。
-4. 观察 Worker 日志应该结束于：
+3. 首先确认：
+
+```text
+GET /       → 200 JSON
+GET /health → 200 JSON
+```
+
+4. 确认健康检查请求不会启动 Worker、不访问 Vercel Bridge、不加载模型。
+5. 创建 3 个 Job。
+6. 观察 Worker 日志应该结束于：
 
 ```text
 queue empty, worker finished processed=3
@@ -360,12 +425,13 @@ running (1/1)
 
 1. Idle timeout 的 activity 判定。
 2. CPU metric 的 scale-down 行为。
-3. Deployment proxy 是否存在持续活动连接。
-4. 是否存在内部 health/traffic 请求。
-5. Readiness health check 是否需要配置。
-6. Release 状态是否影响 scale-down。
+3. `/health` 请求是否被计为持续 activity。
+4. Deployment proxy 是否存在持续活动连接。
+5. 是否存在内部 health/traffic 请求。
+6. Readiness health check 是否需要配置。
+7. Release 状态是否影响 scale-down。
 
-## 13. 性能与内存验证
+## 14. 性能与内存验证
 
 同一 Worker Run：
 
@@ -385,7 +451,7 @@ Job 3 → reuse
 
 Job cleanup RSS 不要求立即回到启动时水平；glibc 和 ONNX Runtime 可能保留可复用内存。真正重要的是 Worker Run 结束后模型 session 被清理，以及不会因为 Job 数量无限增长。
 
-## 14. 当前生产前检查清单
+## 15. 当前生产前检查清单
 
 - [x] Worker Bridge
 - [x] heartbeat
@@ -402,6 +468,11 @@ Job cleanup RSS 不要求立即回到启动时水平；glibc 和 ONNX Runtime �
 - [x] Lightning `max replicas=1`
 - [x] Lightning `idle timeout=300s`
 - [x] 撤销应用主动 `os._exit(0)`
+- [x] `/` root metadata endpoint
+- [x] `/health` liveness/metadata endpoint
+- [x] Docker 使用 `app_entry:app`
+- [ ] 实测新 Docker image 中 `/` 与 `/health` 均返回 200
+- [ ] 实测 health request 不启动 Worker
 - [ ] 实测 Worker thread 停止后 Lightning 自动 scale-to-zero
 - [ ] 实测 300s idle timeout 后 replica=0
 - [ ] 实测 scale-to-zero 后下一次 `/process-queue` 能重新创建 replica
