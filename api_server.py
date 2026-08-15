@@ -13,16 +13,22 @@ import threading
 import time
 
 
-app = FastAPI(title="HivisionIDPhotos API", version="3.1.0")
+app = FastAPI(title="HivisionIDPhotos API", version="3.2.0")
 
 creator = IDCreator()
 creator.matting_handler = extract_human_birefnet_lite
 creator.detection_handler = detect_face_retinaface
 
-# The worker is deliberately single-threaded: one queue job at a time.
+# One Lightning container owns one Worker Run. Model inference is always serial.
 inference_lock = threading.Lock()
 worker_lock = threading.Lock()
 worker_running = False
+
+# The Vercel bridge starts with a 10-minute lease. Heartbeat extends it by 10 minutes.
+HEARTBEAT_INTERVAL_SECONDS = 60
+REQUEST_TIMEOUT_SECONDS = 30
+DOWNLOAD_TIMEOUT_SECONDS = 60
+UPLOAD_TIMEOUT_SECONDS = 120
 
 
 def _run_inference(data: bytes, width: int, height: int) -> tuple[bytes, float]:
@@ -59,15 +65,22 @@ def root():
     return {
         "service": "HivisionIDPhotos API",
         "status": "ok",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "queue_worker": True,
         "worker_mode": "serial",
+        "bridge_contract": "vercel-worker-v1",
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "run_mode": os.getenv("RUN_MODE", "normal")}
+    with worker_lock:
+        running = worker_running
+    return {
+        "status": "healthy",
+        "run_mode": os.getenv("RUN_MODE", "normal"),
+        "worker_running": running,
+    }
 
 
 @app.get("/worker/status")
@@ -82,6 +95,7 @@ async def generate(
     width: int = Form(295),
     height: int = Form(413),
 ):
+    """Legacy synchronous API, kept for direct/manual inference testing."""
     data = await image.read()
     try:
         output, elapsed = _run_inference(data, width, height)
@@ -101,50 +115,97 @@ async def generate(
     )
 
 
-def _process_jobs(bridge_url: str, max_jobs: int | None) -> None:
-    """Drain the Vercel queue strictly serially, then stop immediately."""
+def _bridge_headers(worker_credential: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {worker_credential}",
+        "Content-Type": "application/json",
+    }
+
+
+def _heartbeat_loop(bridge_url: str, worker_credential: str, job_id: str, stop_event: threading.Event) -> None:
+    """Keep the current Job lease alive while GPU inference is running."""
+    import requests
+
+    while not stop_event.wait(HEARTBEAT_INTERVAL_SECONDS):
+        try:
+            response = requests.post(
+                f"{bridge_url}/api/worker/heartbeat",
+                headers=_bridge_headers(worker_credential),
+                json={"jobId": job_id},
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+            if response.status_code == 401:
+                print(f"[QueueWorker] heartbeat unauthorized job={job_id}")
+                return
+            if response.status_code == 409:
+                print(f"[QueueWorker] heartbeat lease expired job={job_id}")
+                return
+            response.raise_for_status()
+        except Exception as exc:
+            # A transient heartbeat failure must not kill inference. The next
+            # heartbeat can recover the lease while it is still valid.
+            print(f"[QueueWorker] heartbeat failed job={job_id}: {exc}")
+
+
+def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, max_jobs: int | None) -> None:
+    """Drain the Vercel bridge strictly serially, then finish the Worker Run."""
     global worker_running
     processed = 0
+
     try:
         import requests
 
         bridge_url = bridge_url.rstrip("/")
+        headers = _bridge_headers(worker_credential)
 
         while max_jobs is None or processed < max_jobs:
-            response = requests.get(
+            response = requests.post(
                 f"{bridge_url}/api/worker/next",
-                timeout=30,
+                headers=headers,
+                json={},
+                timeout=REQUEST_TIMEOUT_SECONDS,
             )
-            if response.status_code == 204:
-                requests.post(
-                    f"{bridge_url}/api/worker/finish",
-                    json={"processed": processed},
-                    timeout=30,
-                ).raise_for_status()
-                break
 
+            if response.status_code == 401:
+                raise RuntimeError("worker credential is invalid or expired")
             response.raise_for_status()
-            job = response.json().get("job")
-            if not job:
+            payload = response.json()
+            status = payload.get("status")
+
+            if status == "empty":
+                finish = requests.post(
+                    f"{bridge_url}/api/worker/finish",
+                    headers=headers,
+                    json={"processed": processed},
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+                finish.raise_for_status()
+                print(f"[QueueWorker] queue empty, worker finished processed={processed}")
                 break
 
-            job_id = str(job["jobId"])
-            if job.get("skip"):
-                processed += 1
-                continue
+            if status != "job" or not payload.get("job"):
+                raise RuntimeError(f"unexpected /next response: {payload}")
 
+            job = payload["job"]
+            job_id = str(job["id"])
             started = time.perf_counter()
-            try:
-                requests.post(
-                    f"{bridge_url}/api/worker/job/{job_id}/start",
-                    timeout=30,
-                ).raise_for_status()
+            heartbeat_stop = threading.Event()
+            heartbeat_thread = threading.Thread(
+                target=_heartbeat_loop,
+                args=(bridge_url, worker_credential, job_id, heartbeat_stop),
+                name=f"heartbeat-{job_id}",
+                daemon=True,
+            )
+            heartbeat_thread.start()
 
-                input_response = requests.get(job["inputUrl"], timeout=60)
+            try:
+                input_response = requests.get(
+                    job["inputUrl"],
+                    timeout=DOWNLOAD_TIMEOUT_SECONDS,
+                )
                 input_response.raise_for_status()
 
-                # _run_inference contains an explicit lock; only one job can use the model.
-                output, _ = _run_inference(
+                output, inference_elapsed = _run_inference(
                     input_response.content,
                     int(job.get("width", 295)),
                     int(job.get("height", 413)),
@@ -154,53 +215,78 @@ def _process_jobs(bridge_url: str, max_jobs: int | None) -> None:
                     job["outputUrl"],
                     data=output,
                     headers={"Content-Type": "image/png"},
-                    timeout=120,
+                    timeout=UPLOAD_TIMEOUT_SECONDS,
                 ).raise_for_status()
 
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
-                requests.post(
-                    f"{bridge_url}/api/worker/job/{job_id}",
-                    json={"status": "completed", "processingTimeMs": elapsed_ms},
-                    timeout=30,
-                ).raise_for_status()
+                complete = requests.post(
+                    f"{bridge_url}/api/worker/complete",
+                    headers=headers,
+                    json={
+                        "jobId": job_id,
+                        "workerRunId": worker_run_id,
+                        "processingTimeMs": elapsed_ms,
+                    },
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+                complete.raise_for_status()
                 processed += 1
-                print(f"[QueueWorker] completed job={job_id} time={elapsed_ms}ms")
+                print(
+                    f"[QueueWorker] completed job={job_id} "
+                    f"total={elapsed_ms}ms inference={inference_elapsed:.3f}s"
+                )
+
             except Exception as exc:
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
                 try:
-                    requests.post(
-                        f"{bridge_url}/api/worker/job/{job_id}",
+                    failed = requests.post(
+                        f"{bridge_url}/api/worker/fail",
+                        headers=headers,
                         json={
-                            "status": "failed",
+                            "jobId": job_id,
+                            "workerRunId": worker_run_id,
                             "error": str(exc)[:2000],
-                            "processingTimeMs": elapsed_ms,
                         },
-                        timeout=30,
-                    ).raise_for_status()
+                        timeout=REQUEST_TIMEOUT_SECONDS,
+                    )
+                    failed.raise_for_status()
                 except Exception as callback_error:
-                    print(f"[QueueWorker] callback failed job={job_id}: {callback_error}")
+                    print(f"[QueueWorker] fail callback failed job={job_id}: {callback_error}")
                 processed += 1
-                print(f"[QueueWorker] failed job={job_id} error={exc}")
+                print(f"[QueueWorker] failed job={job_id} time={elapsed_ms}ms error={exc}")
+            finally:
+                heartbeat_stop.set()
+                heartbeat_thread.join(timeout=2)
+
     except Exception as exc:
-        print(f"[QueueWorker] stopped unexpectedly: {exc}")
+        print(f"[QueueWorker] stopped unexpectedly run={worker_run_id}: {exc}")
     finally:
         with worker_lock:
             worker_running = False
-        print(f"[QueueWorker] stopped processed={processed}")
+        print(f"[QueueWorker] stopped run={worker_run_id} processed={processed}")
 
 
 @app.post("/process-queue")
 def process_queue(payload: dict):
-    """Wake the serial queue worker.
+    """Wake a stateless Lightning Worker Run.
 
-    Authentication/authorization for this endpoint is intentionally handled by
-    the Lightning platform. The application does not read, validate, or store
-    LIGHTNING_API_KEY. Vercel supplies the platform-issued key when it calls
-    this endpoint.
+    Vercel authenticates this request at the Lightning platform level with its
+    platform-issued API key. The application deliberately has no Lightning,
+    R2, Database, or Queue project credentials in its environment.
+
+    The short-lived Worker Credential is supplied only in this request body and
+    is then used as a Bearer credential when calling the Vercel Bridge.
     """
-    bridge_url = str(payload.get("bridgeUrl", "")).strip()
+    bridge_url = str(payload.get("bridgeUrl", "")).strip().rstrip("/")
+    worker_run_id = str(payload.get("workerRunId", "")).strip()
+    worker_credential = str(payload.get("workerCredential", "")).strip()
+
     if not bridge_url or not bridge_url.startswith(("https://", "http://")):
         raise HTTPException(status_code=400, detail="Valid bridgeUrl is required")
+    if not worker_run_id:
+        raise HTTPException(status_code=400, detail="workerRunId is required")
+    if len(worker_credential) < 32:
+        raise HTTPException(status_code=400, detail="workerCredential is required")
 
     max_jobs = payload.get("maxJobs")
     if max_jobs is not None:
@@ -214,14 +300,18 @@ def process_queue(payload: dict):
     global worker_running
     with worker_lock:
         if worker_running:
-            return {"status": "already_running", "mode": "serial"}
+            return {"status": "already_running", "mode": "serial", "workerRunId": worker_run_id}
         worker_running = True
         thread = threading.Thread(
             target=_process_jobs,
-            args=(bridge_url, max_jobs),
+            args=(bridge_url, worker_run_id, worker_credential, max_jobs),
             name="id-photo-queue-worker",
             daemon=True,
         )
         thread.start()
 
-    return {"status": "started", "mode": "serial"}
+    return {
+        "status": "started",
+        "mode": "serial",
+        "workerRunId": worker_run_id,
+    }
