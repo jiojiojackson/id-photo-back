@@ -15,6 +15,53 @@
 - 同一 Worker Run 内复用 BiRefNet / RetinaFace ONNX session。
 - Worker Run 结束时释放模型缓存和每 Job 临时内存。
 - **Worker Run 结束不能主动退出 Uvicorn 主进程。** Lightning Deployment 的 replica 生命周期由 Lightning Autoscaler 管理。
+- Production ASGI entrypoint 为 `app_entry.py`，在导入 `api_server.app` 后提供平台所需的 `/` 与 `/health` 元数据端点。
+
+## System Metadata / Health Endpoints
+
+Docker 当前启动：
+
+```text
+uvicorn app_entry:app --host 0.0.0.0 --port 8000
+```
+
+`app_entry.py` 不改变现有业务逻辑，只给现有 FastAPI app 增加两个轻量端点：
+
+```text
+GET /
+GET /health
+```
+
+`GET /` 返回：
+
+```text
+service
+version
+status
+worker_running
+endpoints
+```
+
+`GET /health` 返回：
+
+```text
+status=healthy
+service
+version
+worker_running
+started_at
+checked_at
+```
+
+两个端点都不会：
+
+- 启动 Queue Worker。
+- 访问 Vercel Bridge。
+- 访问 Queue。
+- 加载 ONNX 模型。
+- 修改 Job 状态。
+
+因此它们适合 Lightning / Docker / 反向代理进行轻量 liveness/metadata 检查，不会因为健康检查而唤醒业务 Worker。
 
 ## Lightning Deployment 当前配置
 
@@ -40,6 +87,8 @@ Readiness health check: none
 Lightning Deployment
   ↓
 Uvicorn / FastAPI 主进程保持运行
+  ↓
+GET /health 可被平台检查，不启动 Worker
   ↓
 POST /process-queue
   ↓
@@ -251,8 +300,10 @@ Worker Credential 无效/过期
 启动：
 
 ```bash
-uvicorn api_server:app --host 0.0.0.0 --port 8000
+uvicorn app_entry:app --host 0.0.0.0 --port 8000
 ```
+
+`app_entry.py` 是很薄的 ASGI 包装层，业务实现仍在 `api_server.py`。
 
 Docker 基础依赖：
 
@@ -340,6 +391,20 @@ Lightning autoscaler / idle timeout
 replicas → 0
 ```
 
+健康检查链路现在为：
+
+```text
+Lightning / platform
+ ↓
+GET /health
+ ↓
+app_entry.py
+ ↓
+200 JSON metadata
+```
+
+不会进入 Worker Bridge 或 Queue。
+
 ## 最近修复
 
 ### Docker / Gradio
@@ -364,11 +429,40 @@ exiting process for scale-to-zero
 
 当前正确策略是：**应用只结束 Worker thread，不结束 Deployment 主进程；由 Lightning Autoscaler 根据 CPU / Idle timeout 管理 replica 生命周期。**
 
+### Root / Health 404
+
+Production 原先直接使用 `api_server:app`，没有定义 `/` 和 `/health`，因此平台访问这些端点得到 404。
+
+当前增加 `app_entry.py`：
+
+```text
+GET /
+GET /health
+```
+
+两个端点只返回服务元数据，不启动 Worker、不访问 Queue、不访问 Vercel Bridge、不加载模型。
+
+Docker CMD 已改为：
+
+```text
+uvicorn app_entry:app --host 0.0.0.0 --port 8000
+```
+
+这样不会改变既有 `/generate` 与 `/process-queue` 行为，同时为平台提供稳定的 200 health/metadata response。
+
 ## 当前待验证
 
-1. 发布包含本次 `os._exit(0)` 撤销的 Docker image。
-2. 完成一次 3 Job Worker Run。
-3. 确认日志最后为：
+1. 构建包含 `app_entry.py` 的 Docker image。
+2. 本地运行 Container 后确认：
+
+```text
+GET /       → 200 JSON
+GET /health → 200 JSON
+```
+
+3. 确认 `/health` 不启动 Worker、不加载模型。
+4. 完成一次 3 Job Worker Run。
+5. 确认日志最后为：
 
 ```text
 queue empty, worker finished processed=3
@@ -382,18 +476,30 @@ stopped run=... processed=3
 exiting process for scale-to-zero
 ```
 
-4. 确认 Worker thread 停止后 Uvicorn 主进程继续运行。
-5. 确认 CPU/workload 降低后，Lightning `Idle timeout=300s` 生效。
-6. 确认 replica 从 `1/1` 自动变为 `0`，而不是重新创建一个空闲 replica。
-7. 如果 300 秒后仍不能 scale-to-zero，再单独调查 Lightning Deployment autoscaler 的 activity/idle 判定，不再通过应用主动退出进程解决。
-8. 下一次用户开始处理时，确认 Lightning 能重新创建 replica，并启动新的 Worker Run。
+6. 确认 Worker thread 停止后 Uvicorn 主进程继续运行。
+7. 确认 CPU/workload 降低后，Lightning `Idle timeout=300s` 生效。
+8. 确认 replica 从 `1/1` 自动变为 `0`，而不是重新创建一个空闲 replica。
+9. 如果 300 秒后仍不能 scale-to-zero，再单独调查 Lightning Deployment autoscaler 的 activity/idle 判定，不再通过应用主动退出进程解决。
+10. 下一次用户开始处理时，确认 Lightning 能重新创建 replica，并启动新的 Worker Run。
 
 ## 当前关键提交
 
-本次修复：
+本次修复新增：
 
 ```text
-fix: let Lightning autoscaler stop idle replicas
+app_entry.py
 ```
 
-Worker Run 与 Deployment 主进程的生命周期现在明确分离。
+并将 Docker production ASGI entrypoint 从：
+
+```text
+api_server:app
+```
+
+改为：
+
+```text
+app_entry:app
+```
+
+Worker Run 与 Deployment 主进程的生命周期现在明确分离，同时 Deployment 拥有稳定的 root/health metadata endpoints。
