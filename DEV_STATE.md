@@ -72,6 +72,66 @@ BiRefNet + RetinaFace 本身内存占用较高，因此本方案重点是：
 - Worker Run 结束主动释放模型引用。
 - Lightning 空闲时不需要通过代码保持模型常驻。
 
+## 每 Job 临时内存清理：2026-08-15
+
+3 Job 测试中发现：虽然 ONNX model 已经成功在 Worker Run 内复用，但需要继续关注 Job 之间的 RSS 是否持续增长。
+
+检查 `api_server.py` 后确认每 Job 会创建：
+
+- `requests.Response`
+- 输入图片 bytes
+- PIL Image
+- NumPy RGB/BGR 数组
+- IDCreator 中间结果
+- OpenCV 输出数组
+- PNG encoded bytes
+- `/next` 返回的 Job/Payload 对象
+- heartbeat 线程和 Event
+
+现在每个 Job 完成后增加显式清理：
+
+```text
+input_response.close()
+↓
+删除 input_data
+↓
+释放 PIL / NumPy / OpenCV / IDCreator 临时引用
+↓
+删除 output PNG bytes
+↓
+关闭 output Response
+↓
+gc.collect()
+↓
+Linux/glibc best-effort malloc_trim(0)
+↓
+记录当前 VmRSS
+```
+
+**注意：这里不会清理 BiRefNet / RetinaFace ONNX session。** 它们属于 Worker Run，必须保留到队列结束。
+
+同时新增 Linux `/proc/self/status` 的 `VmRSS` 日志，例如：
+
+```text
+[QueueWorker] memory label=job_complete rss_mb=...
+[QueueWorker] memory label=job_cleanup rss_mb=...
+```
+
+Worker Run 结束后也记录：
+
+```text
+[QueueWorker] memory label=worker_run_end rss_mb=...
+```
+
+这样可以区分：
+
+1. Job 临时对象没有释放。
+2. Python/glibc allocator 保留了已释放 heap。
+3. ONNX Runtime session/arena 本身保留内存。
+4. 真正存在跨 Job 的引用泄漏。
+
+如果 `job_cleanup` 后 RSS 仍逐 Job 上升，需要结合这些日志进一步判断，而不能仅凭平台显示的“运行内存”直接认定是 Python 对象泄漏。
+
 ## 已完成
 
 - 保留原 `/generate` 同步 API，便于单张图片手动测试。
@@ -93,6 +153,7 @@ BiRefNet + RetinaFace 本身内存占用较高，因此本方案重点是：
 - 修复前端 middleware 对 `/api/worker/*` 的浏览器 Cookie 认证拦截（由前端仓库完成）。
 - 实测成功完成 3 Job 串行 Worker Run。
 - 模型改为 Worker Run 级缓存：同一 Run 内 BiRefNet / RetinaFace 只加载一次，Run 结束主动清理。
+- 每 Job 增加临时图片/HTTP/Python 对象清理、GC、Linux glibc best-effort trim，并记录 Worker RSS。
 
 ## 2026-08-15 联合调试结果
 
@@ -135,7 +196,36 @@ processed=3
 
 日志中每个 Job 都出现 `Loading ONNX model took ...`，确认存在重复加载。
 
-本次代码已针对该问题修复。下一次 3 Job 测试应该只在 Worker Run 第一次实际推理时看到 ONNX model loading；Job 2/3 不应再次出现该日志。
+修复后测试：
+
+```text
+Job 1 inference=16.629s
+Job 2 inference=15.682s
+Job 3 inference=12.327s
+processed=3
+```
+
+只有 Job 1 出现：
+
+```text
+Loading ONNX model took 2.5823 seconds
+```
+
+Job 2、Job 3：
+
+```text
+Loading ONNX model took 0.0000 seconds
+```
+
+并在 Run 结束看到：
+
+```text
+[QueueWorker] model cache cleared run=... scope=worker_run
+```
+
+确认 Worker Run 级模型复用已经生效。
+
+下一阶段重点验证新增的 `job_complete` / `job_cleanup` RSS 日志，判断用户观察到的第 2、3 个 Job 内存上升是否来自真正的临时对象泄漏，还是 Python/glibc/ONNX Runtime allocator 的保留内存。
 
 ## 当前调试方案：Lightning Studio Linux 直接运行
 
@@ -191,27 +281,18 @@ python3 -m uvicorn api_server:app --host 0.0.0.0 --port 8000
 
 ## 当前待验证
 
-1. 重启 Lightning Studio FastAPI，使最新模型缓存代码生效。
+1. 重启 Lightning Studio FastAPI，使最新 per-Job cleanup 代码生效。
 2. 提交 3 个 Job。
 3. 点击开始处理。
-4. 确认 Worker Run 首个 Job 出现一次：
-
-```text
-Loading ONNX model took ...
-```
-
-5. 确认 Job 2、Job 3 不再出现该日志。
-6. 确认 3 Job 均成功 complete。
-7. 确认 finish 后日志出现：
-
-```text
-[QueueWorker] model cache cleared run=...
-```
-
-8. 下一次新的 Worker Run 应重新加载模型一次；这是刻意设计的 Worker Run 生命周期，不是进程级常驻。
-9. heartbeat、Worker 崩溃、lease recovery、重复 complete、fail-retry、credential expiry。
-10. 调试链路稳定后，再切回 Lightning 平台 Wake 模式。
+4. 检查每个 Job 的 `memory label=job_complete` 与 `memory label=job_cleanup`。
+5. 如果 cleanup 后 RSS 基本稳定，说明之前的上升主要来自临时对象/allocator 保留。
+6. 如果 cleanup 后 RSS 仍持续明显上升，需要继续定位 Hivision/ONNX Runtime 的跨 Job 内存缓存或真正的引用泄漏。
+7. 确认 3 Job 均成功 complete。
+8. 确认 finish 后日志出现 `model cache cleared` 和 `worker_run_end`。
+9. 下一次新的 Worker Run 应重新加载模型一次；这是刻意设计的 Worker Run 生命周期，不是进程级常驻。
+10. heartbeat、Worker 崩溃、lease recovery、重复 complete、fail-retry、credential expiry。
+11. 调试链路稳定后，再切回 Lightning 平台 Wake 模式。
 
 ## 当前提交
 
-后端最新 commit：`f7fddd24ad7515615a9854339546cc7a648e2f24`。
+后端最新 commit：`534b25f302ad48a5ece6966aded9a32296bdc337`。
