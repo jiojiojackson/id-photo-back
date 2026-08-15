@@ -33,6 +33,7 @@ Lightning 作为无状态 GPU Worker：
 - 每个 Job 只启动一个 heartbeat 线程；GPU inference 本身仍由 `inference_lock` 严格串行。
 - 输出使用 Job 返回的 R2 presigned PUT URL 写入 PNG。
 - 单个 Job 失败不会停止整个 Worker Run；会回调 fail 后继续处理下一个 Job。
+- Lightning Worker 现在会在调用 Vercel Bridge 前输出完整请求 URL，包括协议、主机名、端口和路径；不会输出 Worker Credential。
 
 ## 联合调试进度
 
@@ -89,6 +90,33 @@ Lightning Studio Linux
        └─ POST Vercel /api/worker/next
 ```
 
+### Vercel Bridge URL 诊断
+
+Worker 会对以下所有 Bridge 请求打印完整 URL：
+
+```text
+POST <bridge_url>/api/worker/next
+POST <bridge_url>/api/worker/heartbeat
+POST <bridge_url>/api/worker/complete
+POST <bridge_url>/api/worker/fail
+POST <bridge_url>/api/worker/finish
+```
+
+日志格式例如：
+
+```text
+[QueueWorker] Vercel request stage=next method=POST url=https://id-photo-front.vercel.app/api/worker/next run=<run-id>
+```
+
+这样可以直接确认：
+
+1. hostname 是否是正确的 Vercel 项目域名；
+2. 是否误指向 Preview/旧部署域名；
+3. 是否存在错误的 path；
+4. 是否存在错误的协议或端口。
+
+不会打印 `worker_credential`、Authorization header 或其他 secret。
+
 ### 启动服务
 
 在 Lightning Studio Linux 服务器上，直接运行，不使用 Docker：
@@ -110,44 +138,6 @@ python3 -m uvicorn api_server:app --host 0.0.0.0 --port 8000
 服务端口：`8000`。
 
 需要将 Lightning Studio 的公网 URL 指向这个 FastAPI 服务。Vercel 会自动调用其 `/process-queue` 路径。
-
-### 本地/服务器验证
-
-```bash
-curl http://127.0.0.1:8000/health
-curl http://127.0.0.1:8000/
-```
-
-预期 `/health` 返回 `healthy`。
-
-### 调试模式下的认证边界
-
-Lightning Studio FastAPI 不需要：
-
-- `LIGHTNING_API_KEY`
-- `DATABASE_URL`
-- R2 credentials
-- Queue credentials
-
-但 **不能删除 `worker_credential`**。它仍然由 Vercel 生成并放进 `/process-queue` body，Worker 随后使用：
-
-```text
-Authorization: Bearer <worker_credential>
-```
-
-访问 Vercel Bridge。
-
-因此调试模式只是移除：
-
-```text
-Vercel → Lightning platform API Key
-```
-
-并没有移除：
-
-```text
-Lightning Worker → Vercel Bridge Worker Credential
-```
 
 ## 当前重要约定
 
@@ -172,13 +162,14 @@ POST /process-queue
 ## 当前待验证
 
 1. Lightning Studio 直接运行 FastAPI 后，Vercel → `/process-queue` 是否稳定返回 200。
-2. Worker → Vercel `/api/worker/next` 的 Credential 401 是否仍存在。
-3. 如果认证通过，完成 1 Job：claim → R2 input → inference → R2 output → complete。
-4. 再完成 3 Job 串行测试。
-5. heartbeat、Worker 崩溃、lease recovery、重复 complete、fail-retry、credential expiry。
-6. 真实推理 p95 / 最大时间，之后校准 10 分钟 lease、60 秒 heartbeat 和 15 分钟 R2 URL。
-7. 调试链路稳定后，再切回 Lightning 平台 Wake 模式并继续处理此前平台模式的 Credential 401。
+2. 从后端日志确认完整 Vercel Bridge hostname/path 正确。
+3. Worker → Vercel `/api/worker/next` 的 Credential 401 是否仍存在。
+4. 如果认证通过，完成 1 Job：claim → R2 input → inference → R2 output → complete。
+5. 再完成 3 Job 串行测试。
+6. heartbeat、Worker 崩溃、lease recovery、重复 complete、fail-retry、credential expiry。
+7. 真实推理 p95 / 最大时间，之后校准 10 分钟 lease、60 秒 heartbeat 和 15 分钟 R2 URL。
+8. 调试链路稳定后，再切回 Lightning 平台 Wake 模式并继续处理此前平台模式的 Credential 401。
 
 ## 当前提交
 
-后端 Worker Contract 已实现于 `agent/queue-worker-bridge`。当前调试不需要新的后端代码改动；直接启动现有 `api_server.py` 即可。
+后端当前最新调试 commit：`0af3e7e0c2f3213473c09e7e024f47075dab7e8c`。
