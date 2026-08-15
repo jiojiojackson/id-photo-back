@@ -7,6 +7,8 @@ Vercel
   ↓ POST /process-queue
 Lightning Studio / Lightning Inference
   ↓
+Single-use Worker Container
+  ↓
 Worker Run
   ├─ 初始化 Worker Run 模型缓存
   ├─ POST /api/worker/next
@@ -16,10 +18,14 @@ Worker Run
   ├─ R2 output PUT
   ├─ POST /api/worker/complete
   ├─ heartbeat
-  └─ queue empty → finish → 释放模型
+  └─ queue empty → finish → 释放模型 → 进程退出
+                                      ↓
+                                  Container stopped
+                                      ↓
+                                  scale-to-zero
 ```
 
-Lightning 是无状态 Worker：空闲时不保持一个专门的模型 Worker Run。模型生命周期绑定一次 Worker Run。
+Lightning 是无状态 Worker：**一个 Container 对应一次 Worker Run，Worker Run 结束后 Container 必须退出**。空闲时不保持专门的模型 Worker Run。模型生命周期绑定一次 Worker Run。
 
 ## 2. CPU 推理原则
 
@@ -77,11 +83,61 @@ BiRefNet session = None
 RetinaFace session = None
  ↓
 RUN_MODE=normal
+ ↓
+记录 worker_run_end RSS
+ ↓
+退出 Worker 进程
 ```
 
-这样可以避免模型在长期空闲进程中持续占用大量内存。
+这样可以避免模型在长期空闲进程中持续占用大量内存，并确保 Lightning Container 能真正停止并 scale-to-zero。
 
-## 4. 每 Job 临时内存生命周期
+## 4. Worker Container 退出机制
+
+此前 Worker thread 在 queue empty 后会调用 `/api/worker/finish` 并清理模型，但 Uvicorn 主进程仍然继续运行，因此 Lightning Container 不会因为 Worker Run 完成而停止。
+
+现在 `_process_jobs()` 的 `finally` 在完成模型清理后调用：
+
+```python
+_shutdown_worker_process(worker_run_id, processed)
+```
+
+该函数使用：
+
+```python
+os._exit(0)
+```
+
+原因是 `_process_jobs()` 运行在后台 daemon thread 中；`raise SystemExit` 只会终止当前 thread，不会终止 Uvicorn 主进程。
+
+因此完整生命周期为：
+
+```text
+queue empty
+ ↓
+POST /api/worker/finish
+ ↓
+clear ONNX sessions
+ ↓
+RUN_MODE=normal
+ ↓
+worker_run_end RSS log
+ ↓
+exiting process for scale-to-zero
+ ↓
+os._exit(0)
+ ↓
+Uvicorn process exits
+ ↓
+Docker Container stops
+ ↓
+Lightning scale-to-zero
+```
+
+Worker Run 发生未处理异常时同样经过 `_process_jobs()` 的 `finally`，Container 也会退出，避免出现“Worker 已停止但 Uvicorn 一直挂着”的空闲实例。
+
+这是当前架构的硬性生命周期要求：**处理完 Queue 后不保留服务进程。**
+
+## 5. 每 Job 临时内存生命周期
 
 模型复用解决的是 ONNX session 的重复加载，但 Job 之间还有大量短生命周期对象：
 
@@ -142,7 +198,7 @@ memory label=worker_run_end rss_mb=...
 3. ONNX Runtime arena/session 保留内存。
 4. 真正的跨 Job 引用泄漏。
 
-## 5. 预期性能变化
+## 6. 预期性能变化
 
 此前 3 Job 测试中每个 Job 都重新加载 BiRefNet：
 
@@ -158,7 +214,7 @@ Job 3: Loading ONNX model ≈ 2.5s
 
 新的 Worker Run 重新加载一次是预期行为，因为这是 Worker Run 级生命周期，而不是进程级常驻。
 
-## 6. Queue Worker
+## 7. Queue Worker
 
 Worker 严格串行：
 
@@ -176,7 +232,7 @@ next
 
 `inference_lock` 继续保留，避免同步 `/generate` 与 Queue Worker 同时执行模型推理。
 
-## 7. Vercel Bridge
+## 8. Vercel Bridge
 
 ```text
 POST /api/worker/next
@@ -194,7 +250,7 @@ Authorization: Bearer <short-lived-worker-credential>
 
 不使用 Lightning API Key 访问 Vercel Bridge。
 
-## 8. 动态 Preview Hostname
+## 9. 动态 Preview Hostname
 
 禁止硬编码 Vercel hostname。
 
@@ -216,7 +272,7 @@ https://<current-preview-host>/api/worker
 
 分别追加到 `/api/worker` 基础 URL。
 
-## 9. 错误分类
+## 10. 错误分类
 
 Vercel 返回 401 时区分：
 
@@ -230,7 +286,7 @@ Unauthorized
 
 避免把 Deployment Protection 错误误报成 Worker Credential 过期。
 
-## 10. Production Docker
+## 11. Production Docker
 
 正式部署使用**单个 Docker Container**，不使用 `docker-compose.yml`。
 
@@ -253,11 +309,12 @@ fastapi
 uvicorn[standard]
 python-multipart
 pillow
+gradio>=4.43.0
 ```
 
-Docker 不安装 `requirements-app.txt`，因为该文件包含旧 Gradio UI 依赖，Production Worker 不需要 Gradio。
+Docker 不安装 `requirements-app.txt`，但 **Gradio 必须保留为 Worker runtime dependency**，因为当前 `hivision` beauty plugin import 链仍然在模块导入阶段加载 Gradio。
 
-### Gradio 依赖修复
+### Gradio 依赖
 
 Production Worker 导入 `hivision` 时会经过：
 
@@ -267,29 +324,25 @@ hivision.creator
 hivision.plugin.beauty
  ↓
 BeautyTools
- ↓
-grind_skin.py
+ ├─ grind_skin.py → import gradio
+ └─ whitening.py → import gradio
 ```
 
-旧版 `grind_skin.py` 同时包含 Gradio Demo，并在模块导入阶段执行：
-
-```python
-import gradio as gr
-```
-
-导致不安装 Gradio 的 Production Docker 在启动阶段出现：
+因此之前尝试从 `grind_skin.py` 移除 Gradio 后，Docker 又在 `whitening.py` 处启动失败：
 
 ```text
 ModuleNotFoundError: No module named 'gradio'
 ```
 
-正确方案：保留 `grindSkin()` Production 推理函数，移除 `gradio` import、旧 UI `Blocks`、按钮和 `iface.launch()`。这样不需要为了 Worker 安装 Gradio。
+最终采用稳定方案：**恢复 Gradio runtime dependency，而不启动 Gradio Web UI。**
 
-修复提交：
+`requirements-worker.txt` 必须包含：
 
 ```text
-d26367661aac9783bcda51f88b7a9bedcd21be27
+gradio>=4.43.0
 ```
+
+Docker CMD 仍然只启动 FastAPI/Uvicorn。
 
 ### 模型文件
 
@@ -299,7 +352,7 @@ d26367661aac9783bcda51f88b7a9bedcd21be27
 
 `.dockerignore` 排除 Git metadata、Python cache、虚拟环境、build artifacts、docs/demo、Markdown、日志、IDE/OS 文件和 `docker-compose.yml`，但保留 `.onnx`。
 
-## 11. 当前调试方式
+## 12. 当前调试方式
 
 本地 Docker 验证：
 
@@ -320,11 +373,11 @@ docker run --rm -p 8000:8000 id-photo-back
 ModuleNotFoundError: No module named 'gradio'
 ```
 
-该问题已经通过移除 `grind_skin.py` 中的旧 Gradio UI 依赖解决。
+该问题最终通过把 Gradio 恢复为 Worker runtime dependency 解决，而不是继续修改 beauty plugin import 链。
 
 另外可能看到 ONNX Runtime 的 GPU discovery warning；由于当前使用 CPU Execution Provider，该 warning 不属于启动失败原因。
 
-## 12. 验证计划
+## 13. 验证计划
 
 ### Docker 启动
 
@@ -360,6 +413,24 @@ memory label=job_cleanup rss_mb=...
 - 如果 `job_cleanup` 后仍逐 Job 增长：继续检查 ONNX Runtime arena、Hivision 内部缓存以及真正的引用泄漏。
 - 不应因为 RSS 没有立刻下降就直接判断为泄漏；glibc/ONNX Runtime 可能保留可复用内存。
 
+### Container scale-to-zero
+
+完整 Worker Run 必须验证日志顺序：
+
+```text
+queue empty, worker finished
+↓
+model cache cleared
+↓
+worker_run_end
+↓
+exiting process for scale-to-zero
+```
+
+然后 Docker/Lightning Container 的主进程必须退出。
+
+下一次点击“开始处理”时，应由 Vercel 再次唤醒新的 Lightning Container，并重新创建新的 Worker Run；新 Worker Run 首次推理重新加载一次模型是预期行为。
+
 ### 完整链路
 
 ```text
@@ -376,6 +447,12 @@ complete
 next
  ↓
 finish
+ ↓
+clear model cache
+ ↓
+process exit
+ ↓
+Container stopped / scale-to-zero
 ```
 
 ### 后续
@@ -389,7 +466,7 @@ finish
 - 多 Worker Run 并发保护
 - Lightning Platform Wake 模式
 
-## 13. 正式生产前
+## 14. 正式生产前
 
 1. 保持模型为 CPU Execution Provider。
 2. 根据真实内存峰值评估 Lightning Instance 内存规格。
@@ -397,4 +474,5 @@ finish
 4. 验证 Worker Run 结束后模型引用确实释放。
 5. 验证每 Job 临时内存不会无限增长。
 6. 验证 Production Docker image 能启动并运行 `/process-queue`。
-7. 再切换到 Lightning Platform serverless / inference API。
+7. 验证 queue empty 后 Container 进程实际退出并 scale-to-zero。
+8. 再切换到 Lightning Platform serverless / inference API。
