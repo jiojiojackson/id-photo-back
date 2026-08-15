@@ -214,6 +214,7 @@ def _heartbeat_loop(bridge_url: str, worker_credential: str, job_id: str, stop_e
     url = f"{bridge_url}/heartbeat"
     while not stop_event.wait(HEARTBEAT_INTERVAL_SECONDS):
         _log_bridge_request("POST", url, worker_run_id, "heartbeat")
+        response = None
         try:
             response = requests.post(
                 url,
@@ -232,7 +233,8 @@ def _heartbeat_loop(bridge_url: str, worker_credential: str, job_id: str, stop_e
         except Exception as exc:
             print(f"[QueueWorker] heartbeat failed job={job_id}: {exc}", flush=True)
         finally:
-            response.close()
+            if response is not None:
+                response.close()
 
 
 def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, max_jobs: int | None) -> None:
@@ -261,6 +263,7 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
                 json={},
                 timeout=REQUEST_TIMEOUT_SECONDS,
             )
+            payload = None
 
             try:
                 if response.status_code == 401:
@@ -312,6 +315,7 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
             heartbeat_thread.start()
 
             try:
+                input_data = None
                 input_response = requests.get(
                     job["inputUrl"],
                     timeout=DOWNLOAD_TIMEOUT_SECONDS,
@@ -323,78 +327,80 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
                     input_response.close()
 
                 try:
-                    output, inference_elapsed = _run_inference(
-                        input_data,
-                        int(job.get("width", 295)),
-                        int(job.get("height", 413)),
-                    )
-                finally:
-                    del input_data
-                    _release_per_job_memory()
-
-                try:
-                    output_response = requests.put(
-                        job["outputUrl"],
-                        data=output,
-                        headers={"Content-Type": "image/png"},
-                        timeout=UPLOAD_TIMEOUT_SECONDS,
-                    )
+                    output = None
                     try:
-                        output_response.raise_for_status()
+                        output, inference_elapsed = _run_inference(
+                            input_data,
+                            int(job.get("width", 295)),
+                            int(job.get("height", 413)),
+                        )
                     finally:
-                        output_response.close()
-                finally:
-                    del output
-                    _release_per_job_memory()
+                        del input_data
+                        _release_per_job_memory()
 
-                elapsed_ms = int((time.perf_counter() - started) * 1000)
-                complete_url = f"{bridge_url}/complete"
-                _log_bridge_request("POST", complete_url, worker_run_id, "complete")
-                complete = requests.post(
-                    complete_url,
-                    headers=headers,
-                    json={
-                        "jobId": job_id,
-                        "workerRunId": worker_run_id,
-                        "processingTimeMs": elapsed_ms,
-                    },
-                    timeout=REQUEST_TIMEOUT_SECONDS,
-                )
-                try:
-                    complete.raise_for_status()
-                finally:
-                    complete.close()
-                processed += 1
-                _log_process_memory("job_complete", worker_run_id)
-                print(
-                    f"[QueueWorker] completed job={job_id} "
-                    f"total={elapsed_ms}ms inference={inference_elapsed:.3f}s",
-                    flush=True,
-                )
+                    try:
+                        output_response = requests.put(
+                            job["outputUrl"],
+                            data=output,
+                            headers={"Content-Type": "image/png"},
+                            timeout=UPLOAD_TIMEOUT_SECONDS,
+                        )
+                        try:
+                            output_response.raise_for_status()
+                        finally:
+                            output_response.close()
+                    finally:
+                        del output
+                        _release_per_job_memory()
 
-            except Exception as exc:
-                elapsed_ms = int((time.perf_counter() - started) * 1000)
-                fail_url = f"{bridge_url}/fail"
-                _log_bridge_request("POST", fail_url, worker_run_id, "fail")
-                try:
-                    failed = requests.post(
-                        fail_url,
+                    elapsed_ms = int((time.perf_counter() - started) * 1000)
+                    complete_url = f"{bridge_url}/complete"
+                    _log_bridge_request("POST", complete_url, worker_run_id, "complete")
+                    complete = requests.post(
+                        complete_url,
                         headers=headers,
                         json={
                             "jobId": job_id,
                             "workerRunId": worker_run_id,
-                            "error": str(exc)[:2000],
+                            "processingTimeMs": elapsed_ms,
                         },
                         timeout=REQUEST_TIMEOUT_SECONDS,
                     )
                     try:
-                        failed.raise_for_status()
+                        complete.raise_for_status()
                     finally:
-                        failed.close()
-                except Exception as callback_error:
-                    print(f"[QueueWorker] fail callback failed job={job_id}: {callback_error}", flush=True)
-                processed += 1
-                print(f"[QueueWorker] failed job={job_id} time={elapsed_ms}ms error={exc}", flush=True)
+                        complete.close()
+                    processed += 1
+                    _log_process_memory("job_complete", worker_run_id)
+                    print(
+                        f"[QueueWorker] completed job={job_id} "
+                        f"total={elapsed_ms}ms inference={inference_elapsed:.3f}s",
+                        flush=True,
+                    )
+
+                except Exception as exc:
+                    elapsed_ms = int((time.perf_counter() - started) * 1000)
+                    fail_url = f"{bridge_url}/fail"
+                    _log_bridge_request("POST", fail_url, worker_run_id, "fail")
+                    try:
+                        failed = requests.post(
+                            fail_url,
+                            headers=headers,
+                            json={
+                                "jobId": job_id,
+                                "workerRunId": worker_run_id,
+                                "error": str(exc)[:2000],
+                            },
+                            timeout=REQUEST_TIMEOUT_SECONDS,
+                        )
+                        try:
+                            failed.raise_for_status()
+                        finally:
+                            failed.close()
+                    except Exception as callback_error:
+                        print(f"[QueueWorker] fail callback failed job={job_id}: {callback_error}", flush=True)
+                    processed += 1
+                    print(f"[QueueWorker] failed job={job_id} time={elapsed_ms}ms error={exc}", flush=True)
             finally:
                 heartbeat_stop.set()
                 heartbeat_thread.join(timeout=2)
