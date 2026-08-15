@@ -6,6 +6,7 @@ from hivision.creator.face_detector import detect_face_retinaface
 from PIL import Image
 
 import cv2
+import gc
 import io
 import numpy as np
 import os
@@ -28,6 +29,45 @@ HEARTBEAT_INTERVAL_SECONDS = 60
 REQUEST_TIMEOUT_SECONDS = 30
 DOWNLOAD_TIMEOUT_SECONDS = 60
 UPLOAD_TIMEOUT_SECONDS = 120
+
+
+def _log_process_memory(label: str, worker_run_id: str | None = None) -> None:
+    """Log current Linux RSS without adding a psutil dependency."""
+    try:
+        rss_kb = None
+        with open("/proc/self/status", "r", encoding="utf-8") as proc_status:
+            for line in proc_status:
+                if line.startswith("VmRSS:"):
+                    rss_kb = int(line.split()[1])
+                    break
+        if rss_kb is not None:
+            suffix = f" run={worker_run_id}" if worker_run_id else ""
+            print(
+                f"[QueueWorker] memory label={label} rss_mb={rss_kb / 1024:.1f}{suffix}",
+                flush=True,
+            )
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+
+
+def _release_per_job_memory() -> None:
+    """Collect Python-side temporary objects after each Job.
+
+    ONNX Runtime sessions are deliberately NOT touched here: they belong to the
+    Worker Run and must remain cached between Jobs. This cleanup is only for
+    image/NumPy/PIL/HTTP response objects created by an individual Job.
+    """
+    gc.collect()
+
+    # CPython on Linux/glibc can keep freed heap pages in the process allocator,
+    # making RSS appear to grow even after Python references are gone. Best-effort
+    # trim returns completely free pages to the OS when the platform supports it.
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except (AttributeError, OSError):
+        pass
 
 
 def _set_worker_model_cache(enabled: bool) -> None:
@@ -86,6 +126,8 @@ def _prepare_worker_models(worker_run_id: str) -> None:
 def _finish_worker_models(worker_run_id: str) -> None:
     _clear_worker_model_cache()
     _set_worker_model_cache(False)
+    _release_per_job_memory()
+    _log_process_memory("worker_run_end", worker_run_id)
     print(
         f"[QueueWorker] model cache cleared run={worker_run_id} "
         "scope=worker_run",
@@ -101,80 +143,41 @@ def _run_inference(data: bytes, width: int, height: int) -> tuple[bytes, float]:
     if not data:
         raise ValueError("Empty image")
 
+    pil_image = None
+    image_rgb = None
+    image_bgr = None
+    result = None
+    output = None
+    encoded = None
+
     try:
-        pil_image = Image.open(io.BytesIO(data)).convert("RGB")
-        image_rgb = np.array(pil_image)
-        image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-    except Exception as exc:
-        raise ValueError(f"Invalid image: {exc}") from exc
+        try:
+            pil_image = Image.open(io.BytesIO(data)).convert("RGB")
+            image_rgb = np.array(pil_image)
+            image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+        except Exception as exc:
+            raise ValueError(f"Invalid image: {exc}") from exc
 
-    start_time = time.perf_counter()
-    with inference_lock:
-        result = creator(image_bgr, size=(height, width), face_alignment=False)
-    elapsed = time.perf_counter() - start_time
+        start_time = time.perf_counter()
+        with inference_lock:
+            result = creator(image_bgr, size=(height, width), face_alignment=False)
+        elapsed = time.perf_counter() - start_time
 
-    output = result.hd
-    if output is None:
-        raise RuntimeError("HD result is None")
-    success, encoded = cv2.imencode(".png", output)
-    if not success:
-        raise RuntimeError("Failed to encode PNG")
-    return encoded.tobytes(), elapsed
-
-
-@app.get("/")
-def root():
-    return {
-        "service": "HivisionIDPhotos API",
-        "status": "ok",
-        "version": "3.2.0",
-        "queue_worker": True,
-        "worker_mode": "serial",
-        "bridge_contract": "vercel-worker-v1",
-    }
-
-
-@app.get("/health")
-def health():
-    with worker_lock:
-        running = worker_running
-    return {
-        "status": "healthy",
-        "run_mode": os.getenv("RUN_MODE", "normal"),
-        "worker_running": running,
-    }
-
-
-@app.get("/worker/status")
-def worker_status():
-    with worker_lock:
-        return {"running": worker_running, "mode": "serial"}
-
-
-@app.post("/generate")
-async def generate(
-    image: UploadFile = File(...),
-    width: int = Form(295),
-    height: int = Form(413),
-):
-    """Legacy synchronous API, kept for direct/manual inference testing."""
-    data = await image.read()
-    try:
-        output, elapsed = _run_inference(data, width, height)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Inference failed: {exc}") from exc
-
-    return Response(
-        content=output,
-        media_type="image/png",
-        headers={
-            "X-Photo-Width": str(width),
-            "X-Photo-Height": str(height),
-            "X-Inference-Time": f"{elapsed:.3f}",
-        },
-    )
+        output = result.hd
+        if output is None:
+            raise RuntimeError("HD result is None")
+        success, encoded = cv2.imencode(".png", output)
+        if not success:
+            raise RuntimeError("Failed to encode PNG")
+        return encoded.tobytes(), elapsed
+    finally:
+        # These are per-Job objects. Do not clear Hivision's ONNX sessions here.
+        pil_image = None
+        image_rgb = None
+        image_bgr = None
+        result = None
+        output = None
+        encoded = None
 
 
 def _bridge_headers(worker_credential: str) -> dict[str, str]:
@@ -228,6 +231,8 @@ def _heartbeat_loop(bridge_url: str, worker_credential: str, job_id: str, stop_e
             response.raise_for_status()
         except Exception as exc:
             print(f"[QueueWorker] heartbeat failed job={job_id}: {exc}", flush=True)
+        finally:
+            response.close()
 
 
 def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, max_jobs: int | None) -> None:
@@ -257,19 +262,23 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
                 timeout=REQUEST_TIMEOUT_SECONDS,
             )
 
-            if response.status_code == 401:
-                response_body = response.text[:1000]
-                reason = _classify_vercel_401(response)
-                print(
-                    f"[QueueWorker] /next unauthorized run={worker_run_id} "
-                    f"status=401 reason={reason} body={response_body!r}",
-                    flush=True,
-                )
-                if reason == "vercel_deployment_protection":
-                    raise RuntimeError("Vercel Deployment Protection blocked the Worker Bridge request")
-                raise RuntimeError("worker credential was rejected or expired")
-            response.raise_for_status()
-            payload = response.json()
+            try:
+                if response.status_code == 401:
+                    response_body = response.text[:1000]
+                    reason = _classify_vercel_401(response)
+                    print(
+                        f"[QueueWorker] /next unauthorized run={worker_run_id} "
+                        f"status=401 reason={reason} body={response_body!r}",
+                        flush=True,
+                    )
+                    if reason == "vercel_deployment_protection":
+                        raise RuntimeError("Vercel Deployment Protection blocked the Worker Bridge request")
+                    raise RuntimeError("worker credential was rejected or expired")
+                response.raise_for_status()
+                payload = response.json()
+            finally:
+                response.close()
+
             status = payload.get("status")
 
             if status == "empty":
@@ -280,7 +289,10 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
                     json={"processed": processed},
                     timeout=REQUEST_TIMEOUT_SECONDS,
                 )
-                finish.raise_for_status()
+                try:
+                    finish.raise_for_status()
+                finally:
+                    finish.close()
                 print(f"[QueueWorker] queue empty, worker finished processed={processed}", flush=True)
                 break
 
@@ -304,20 +316,36 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
                     job["inputUrl"],
                     timeout=DOWNLOAD_TIMEOUT_SECONDS,
                 )
-                input_response.raise_for_status()
+                try:
+                    input_response.raise_for_status()
+                    input_data = input_response.content
+                finally:
+                    input_response.close()
 
-                output, inference_elapsed = _run_inference(
-                    input_response.content,
-                    int(job.get("width", 295)),
-                    int(job.get("height", 413)),
-                )
+                try:
+                    output, inference_elapsed = _run_inference(
+                        input_data,
+                        int(job.get("width", 295)),
+                        int(job.get("height", 413)),
+                    )
+                finally:
+                    del input_data
+                    _release_per_job_memory()
 
-                requests.put(
-                    job["outputUrl"],
-                    data=output,
-                    headers={"Content-Type": "image/png"},
-                    timeout=UPLOAD_TIMEOUT_SECONDS,
-                ).raise_for_status()
+                try:
+                    output_response = requests.put(
+                        job["outputUrl"],
+                        data=output,
+                        headers={"Content-Type": "image/png"},
+                        timeout=UPLOAD_TIMEOUT_SECONDS,
+                    )
+                    try:
+                        output_response.raise_for_status()
+                    finally:
+                        output_response.close()
+                finally:
+                    del output
+                    _release_per_job_memory()
 
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
                 complete_url = f"{bridge_url}/complete"
@@ -332,8 +360,12 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
                     },
                     timeout=REQUEST_TIMEOUT_SECONDS,
                 )
-                complete.raise_for_status()
+                try:
+                    complete.raise_for_status()
+                finally:
+                    complete.close()
                 processed += 1
+                _log_process_memory("job_complete", worker_run_id)
                 print(
                     f"[QueueWorker] completed job={job_id} "
                     f"total={elapsed_ms}ms inference={inference_elapsed:.3f}s",
@@ -355,7 +387,10 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
                         },
                         timeout=REQUEST_TIMEOUT_SECONDS,
                     )
-                    failed.raise_for_status()
+                    try:
+                        failed.raise_for_status()
+                    finally:
+                        failed.close()
                 except Exception as callback_error:
                     print(f"[QueueWorker] fail callback failed job={job_id}: {callback_error}", flush=True)
                 processed += 1
@@ -363,6 +398,13 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
             finally:
                 heartbeat_stop.set()
                 heartbeat_thread.join(timeout=2)
+                # Drop the per-job payload/thread references before claiming the next job.
+                job = None
+                payload = None
+                heartbeat_thread = None
+                heartbeat_stop = None
+                _release_per_job_memory()
+                _log_process_memory("job_cleanup", worker_run_id)
 
     except Exception as exc:
         print(f"[QueueWorker] stopped unexpectedly run={worker_run_id}: {exc}", flush=True)
