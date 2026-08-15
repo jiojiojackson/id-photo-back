@@ -88,16 +88,21 @@ requirements.txt
 requirements-worker.txt
 ```
 
-只负责 Production Worker Web/API 依赖：
+负责 Production Worker Web/API 以及现有 beauty plugin 的运行时依赖：
 
 ```text
 fastapi
 uvicorn[standard]
 python-multipart
 pillow
+gradio>=4.43.0
 ```
 
-Docker 不再安装 `requirements-app.txt`，因此不会为了 Worker 引入 Gradio。
+**Gradio 需要保留。** 虽然 Production Worker 不启动 Gradio UI，但 `hivision` 的 beauty plugin import 链会在导入 `IDCreator` 时加载 `grind_skin.py` 和 `whitening.py`，而这两个模块当前仍然包含 `import gradio as gr`。因此为了保证 Production Worker 能正常启动，Docker 镜像必须安装 Gradio。
+
+因此本阶段不再尝试从 beauty plugin 中删除 Gradio import，也不在 Docker 中为了“减小镜像”移除该依赖；保持现有已验证代码路径优先。
+
+Docker 不再安装 `requirements-app.txt`，但 `requirements-worker.txt` 会显式提供 Worker 实际 import 所需的 Gradio runtime dependency。
 
 ## Docker 启动方式
 
@@ -130,24 +135,29 @@ api_server:app
 ModuleNotFoundError: No module named 'gradio'
 ```
 
-原因不是 Worker API 使用 Gradio，而是旧的 `hivision/plugin/beauty/grind_skin.py` 同时承担了旧 Gradio Demo/UI 代码和 `grindSkin()` 推理函数。`hivision` 包初始化会导入 `BeautyTools → grind_skin`，因此即使 Production Worker 不启动 Gradio UI，Python import 仍然要求安装 Gradio。
-
-正确处理方式不是把整个 Gradio 再装回 Production Image，而是移除 Production 推理路径不需要的 Gradio runtime dependency：
-
-- `grind_skin.py` 保留 `grindSkin()` 核心图像处理函数。
-- 删除该文件中的 `import gradio as gr`。
-- 删除旧的 Gradio demo/UI 构建代码和 `iface.launch()`。
-- `requirements-worker.txt` 继续保持无 Gradio。
-
-修复提交：
+第一次定位时发现 `grind_skin.py` 包含旧 Gradio Demo/UI import。尝试从该模块删除 Gradio 后，重新构建镜像又在：
 
 ```text
- d26367661aac9783bcda51f88b7a9bedcd21be27
+hivision.plugin.beauty.whitening
 ```
 
-这样 Production Worker 可以继续使用 `BeautyTools → grindSkin()`，但不会因为旧 Demo 代码强制安装 Gradio。
+处出现同样的：
 
-### ONNX Runtime GPU warning
+```text
+ModuleNotFoundError: No module named 'gradio'
+```
+
+这说明当前 `hivision` beauty plugin 的 Production import 链仍然依赖 Gradio runtime。为了不继续修改已经验证的上游推理代码，本阶段采用更稳妥的处理：**把 Gradio 作为 Worker runtime dependency 加回 Docker image。**
+
+因此 `requirements-worker.txt` 现在显式包含：
+
+```text
+gradio>=4.43.0
+```
+
+这不是为了启动 Gradio Web UI，而是为了满足现有 beauty plugin import 依赖。Docker CMD 仍然只启动 FastAPI/Uvicorn，不会启动 Gradio 服务。
+
+## ONNX Runtime GPU warning
 
 Docker 启动时可能看到：
 
@@ -307,16 +317,17 @@ finish
 2. 保留所有 `.onnx` 模型文件进入 image。
 3. Dockerfile 去除重复 FastAPI / multipart / pillow 安装。
 4. 新增 `requirements-worker.txt`，将 Production Worker Web/API 依赖与模型依赖分开。
-5. Dockerfile 不再安装 `requirements-app.txt`，避免引入 Gradio。
-6. 发现旧 `grind_skin.py` 的 Gradio UI import 会在 Production import 阶段强制依赖 Gradio。
-7. 已从 `grind_skin.py` 移除 Gradio import 和旧 UI，仅保留 Production 使用的 `grindSkin()`。
-8. 保持单容器 `uvicorn api_server:app --host 0.0.0.0 --port 8000`。
-9. 不修改 `docker-compose.yml`，因为 Production 不使用它。
-10. 不修改 Worker Bridge 和推理业务逻辑。
+5. Dockerfile 不再安装 `requirements-app.txt`，避免重复安装 Worker Web 依赖。
+6. 首次 Docker 启动发现 `hivision` beauty plugin import 链仍然要求 Gradio。
+7. 已将 `gradio>=4.43.0` 加回 `requirements-worker.txt`，满足 `grind_skin.py` / `whitening.py` 的现有 import 依赖。
+8. 不再修改 beauty plugin 的已验证代码路径。
+9. 保持单容器 `uvicorn api_server:app --host 0.0.0.0 --port 8000`。
+10. 不修改 `docker-compose.yml`，因为 Production 不使用它。
+11. 不修改 Worker Bridge 和推理业务逻辑。
 
 ## 当前待验证
 
-1. 重新执行 Docker build。
+1. 重新执行 Docker build（建议 `--no-cache`）。
 2. 确认 `.onnx` 文件全部进入 image。
 3. 确认容器可以启动 FastAPI / Uvicorn，且不再出现 `ModuleNotFoundError: gradio`。
 4. 确认 `/process-queue` 可以被 Lightning Platform 正常调用。
@@ -335,5 +346,6 @@ Docker packaging commits：
 44135e2e828be6b01be495d1a08971ea57c0352b  # .dockerignore
 cdd75d15ddff6caddea687a836f4bfc932c7b0aa  # requirements-worker.txt
 df5818a81fcb590c2acc156c180c985e48bca7f5  # Dockerfile
-d26367661aac9783bcda51f88b7a9bedcd21be27  # remove Gradio runtime dependency
+d26367661aac9783bcda51f88b7a9bedcd21be27  # previous attempted beauty-plugin cleanup; superseded by restoring Gradio runtime dependency
+b5df019ce4b4b11cc3d6f4c89c3d3ea7bc07d467  # restore Gradio runtime dependency
 ```
