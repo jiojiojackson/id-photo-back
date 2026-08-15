@@ -8,7 +8,7 @@
 
 后端业务链路已经调试完成，现在进入 **Production Docker Container 打包阶段**。
 
-本阶段只做 Docker packaging / dependency cleanup，不改变已经验证的 Worker Bridge、heartbeat、lease、inference 或 Worker Run 生命周期逻辑。
+本阶段只做 Docker packaging / dependency cleanup 和单次 Worker Container 生命周期处理，不改变已经验证的 Worker Bridge、heartbeat、lease、inference 或 Worker Run 业务逻辑。
 
 Lightning 使用单个 Docker Container，启动：
 
@@ -34,10 +34,80 @@ Worker Run
   ├─ R2 output PUT
   ├─ POST /api/worker/complete
   ├─ heartbeat
-  └─ queue empty → finish → 释放模型
+  └─ queue empty → finish → 释放模型 → 进程退出
+                                  ↓
+                              Container stopped
+                                  ↓
+                              scale-to-zero
 ```
 
-Lightning Container 是无状态 Worker。模型生命周期绑定一次 Worker Run，空闲时不保持专门的模型 Worker Run。
+Lightning Container 是**单次 Worker Run、无状态、处理完即退出**的 Worker。模型生命周期绑定一次 Worker Run。
+
+## Worker Container 生命周期
+
+这是本次重要修复。
+
+此前 `_process_jobs()` 在 queue empty 后只执行：
+
+```text
+finish
+↓
+_clear_worker_model_cache()
+↓
+RUN_MODE=normal
+↓
+worker_running=False
+```
+
+但是 Uvicorn 主进程仍然继续运行，因此即使 Worker Run 已经完成，Lightning Container 仍然处于运行状态，无法因为进程结束而 scale-to-zero。
+
+现在 `_process_jobs()` 的 `finally` 在完成模型清理和日志记录后调用：
+
+```python
+_shutdown_worker_process(worker_run_id, processed)
+```
+
+该函数使用：
+
+```python
+os._exit(0)
+```
+
+原因是 `_process_jobs()` 本身运行在后台 daemon thread 中；如果只使用 `raise SystemExit`，只会退出当前 Worker thread，Uvicorn 主进程仍会存活。
+
+当前生命周期：
+
+```text
+POST /process-queue
+      ↓
+启动 Worker thread
+      ↓
+处理 Queue Jobs
+      ↓
+queue empty
+      ↓
+POST /api/worker/finish
+      ↓
+清理 ONNX sessions
+      ↓
+RUN_MODE=normal
+      ↓
+记录 worker_run_end RSS
+      ↓
+输出 exiting process for scale-to-zero
+      ↓
+os._exit(0)
+      ↓
+Uvicorn 进程结束
+      ↓
+Docker Container stopped
+      ↓
+Lightning scale-to-zero
+```
+
+如果 Worker Run 因异常停止，也会经过同一个 `finally`，因此 Container 同样会退出，不会留下一个空闲的 Uvicorn 服务。
+
+这是符合当前架构的：**一个 Container 对应一次 Worker Run，Run 完成后 Container 必须结束。**
 
 ## Docker Production 配置
 
@@ -100,8 +170,6 @@ gradio>=4.43.0
 
 **Gradio 需要保留。** 虽然 Production Worker 不启动 Gradio UI，但 `hivision` 的 beauty plugin import 链会在导入 `IDCreator` 时加载 `grind_skin.py` 和 `whitening.py`，而这两个模块当前仍然包含 `import gradio as gr`。因此为了保证 Production Worker 能正常启动，Docker 镜像必须安装 Gradio。
 
-因此本阶段不再尝试从 beauty plugin 中删除 Gradio import，也不在 Docker 中为了“减小镜像”移除该依赖；保持现有已验证代码路径优先。
-
 Docker 不再安装 `requirements-app.txt`，但 `requirements-worker.txt` 会显式提供 Worker 实际 import 所需的 Gradio runtime dependency。
 
 ## Docker 启动方式
@@ -147,9 +215,9 @@ hivision.plugin.beauty.whitening
 ModuleNotFoundError: No module named 'gradio'
 ```
 
-这说明当前 `hivision` beauty plugin 的 Production import 链仍然依赖 Gradio runtime。为了不继续修改已经验证的上游推理代码，本阶段采用更稳妥的处理：**把 Gradio 作为 Worker runtime dependency 加回 Docker image。**
+这说明当前 `hivision` beauty plugin 的 Production import 链仍然依赖 Gradio runtime。为了不继续修改已经验证的上游推理代码，采用：**把 Gradio 作为 Worker runtime dependency 加回 Docker image。**
 
-因此 `requirements-worker.txt` 现在显式包含：
+因此 `requirements-worker.txt` 显式包含：
 
 ```text
 gradio>=4.43.0
@@ -203,6 +271,8 @@ queue empty / worker error
 清理 ONNX sessions
     ↓
 RUN_MODE=normal
+    ↓
+进程退出
 ```
 
 Dockerfile 默认：
@@ -236,6 +306,8 @@ Linux/glibc best-effort malloc_trim(0)
 ```
 
 不会在 Job 之间清理 BiRefNet / RetinaFace ONNX session，因为它们属于 Worker Run。
+
+Worker Run 结束时再清理 ONNX session，记录 `worker_run_end` RSS，然后退出进程。
 
 ## Worker Bridge
 
@@ -281,6 +353,8 @@ Worker Run 内 Job 严格串行。
 
 单个 Job fail 后由 Vercel 根据 `MAX_ATTEMPTS=5` 决定重新排队或最终失败；单个 Job 失败不会停止整个 Worker Run。
 
+Worker Run 完成后 Container 退出；下一个用户点击“开始处理”时由 Vercel 再唤醒新的 Lightning Container。
+
 ## 已验证链路
 
 ```text
@@ -305,9 +379,15 @@ R2 output
 next
  ↓
 finish
+ ↓
+clear model cache
+ ↓
+process exit
+ ↓
+Container stopped / scale-to-zero
 ```
 
-已实测 3 Job 串行 Worker Run 成功，并确认同一 Worker Run 内模型只实际加载一次。
+此前已经实测 3 Job 串行 Worker Run 成功，并确认同一 Worker Run 内模型只实际加载一次。
 
 ## Docker 化本阶段修改
 
@@ -324,6 +404,8 @@ finish
 9. 保持单容器 `uvicorn api_server:app --host 0.0.0.0 --port 8000`。
 10. 不修改 `docker-compose.yml`，因为 Production 不使用它。
 11. 不修改 Worker Bridge 和推理业务逻辑。
+12. 修复 Worker Run 完成后 Uvicorn 主进程继续存活的问题。
+13. Worker Run 结束后清理模型并显式退出进程，使 Docker Container 停止并允许 Lightning scale-to-zero。
 
 ## 当前待验证
 
@@ -332,9 +414,10 @@ finish
 3. 确认容器可以启动 FastAPI / Uvicorn，且不再出现 `ModuleNotFoundError: gradio`。
 4. 确认 `/process-queue` 可以被 Lightning Platform 正常调用。
 5. 重新执行完整 3 Job Worker Run。
-6. 检查 Job cleanup / Worker Run end RSS 日志。
-7. 验证 heartbeat、lease recovery、fail/retry、duplicate complete、credential expiration。
-8. 验证新 Worker Run 会重新加载模型一次，这是预期行为。
+6. 确认日志顺序为：`finish` → `worker_run_end` → `model cache cleared` → `exiting process for scale-to-zero`。
+7. 确认容器进程退出，Lightning 实例最终 scale-to-zero，而不是继续保持运行。
+8. 验证下一次开始处理能够重新创建新的 Worker Run / Container 并重新加载模型一次。
+9. 验证 heartbeat、lease recovery、fail/retry、duplicate complete、credential expiration。
 
 ## 后端当前提交基线
 
@@ -348,4 +431,5 @@ cdd75d15ddff6caddea687a836f4bfc932c7b0aa  # requirements-worker.txt
 df5818a81fcb590c2acc156c180c985e48bca7f5  # Dockerfile
 d26367661aac9783bcda51f88b7a9bedcd21be27  # previous attempted beauty-plugin cleanup; superseded by restoring Gradio runtime dependency
 b5df019ce4b4b11cc3d6f4c89c3d3ea7bc07d467  # restore Gradio runtime dependency
+565b6fe40ddf401fe580f07a83630bf82b03caab  # exit process after Worker Run for Lightning scale-to-zero
 ```
