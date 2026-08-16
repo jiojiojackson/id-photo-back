@@ -489,7 +489,14 @@ def health():
 
 @app.post("/process-queue")
 def process_queue(payload: dict, request: Request):
-    """Start the queue Worker Run without terminating the Lightning API process."""
+    """Process the queue Worker Run inside this HTTP request.
+
+    This deliberately mirrors the historical `/generate` lifecycle: Lightning
+    keeps the request open while inference/queue work is running, and the
+    request only completes after the Worker Run has finished and its model
+    cleanup has completed. No background queue thread and no process exit are
+    used, so the container can become idle naturally after the response.
+    """
     parsed = _process_queue_payload(payload)
 
     forwarded_host = request.headers.get("x-forwarded-host")
@@ -504,21 +511,19 @@ def process_queue(payload: dict, request: Request):
         if worker_running:
             return {"status": "already_running", "mode": "serial", "worker_run_id": parsed["worker_run_id"]}
         worker_running = True
-        thread = threading.Thread(
-            target=_process_jobs,
-            args=(
-                parsed["bridge_url"],
-                parsed["worker_run_id"],
-                parsed["worker_credential"],
-                parsed["max_jobs"],
-            ),
-            name="id-photo-queue-worker",
-            daemon=True,
-        )
-        thread.start()
+
+    # Run synchronously as part of the HTTP request. FastAPI executes this
+    # regular `def` handler in its threadpool, so the event loop remains free,
+    # while Lightning still sees one long-lived request for the whole Worker Run.
+    _process_jobs(
+        parsed["bridge_url"],
+        parsed["worker_run_id"],
+        parsed["worker_credential"],
+        parsed["max_jobs"],
+    )
 
     return {
-        "status": "started",
+        "status": "completed",
         "mode": "serial",
         "worker_run_id": parsed["worker_run_id"],
         "vercel_origin": parsed["vercel_origin"],
