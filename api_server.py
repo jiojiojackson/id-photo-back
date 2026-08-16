@@ -4,6 +4,7 @@ from hivision.creator import IDCreator
 from hivision.creator.human_matting import extract_human_birefnet_lite
 from hivision.creator.face_detector import detect_face_retinaface
 from PIL import Image
+from pathlib import Path
 
 import cv2
 import gc
@@ -16,6 +17,8 @@ from urllib.parse import urlparse
 
 
 app = FastAPI(title="HivisionIDPhotos API", version="3.2.0")
+
+PROJECT_DIR = Path(__file__).resolve().parent
 
 creator = IDCreator()
 creator.matting_handler = extract_human_birefnet_lite
@@ -466,6 +469,21 @@ def _process_queue_payload(payload: dict) -> dict:
         "worker_run_id": worker_run_id,
         "worker_credential": worker_credential,
         "max_jobs": max_jobs,
+    }
+
+@app.get("/")
+def root():
+    return {
+        "service": "HivisionIDPhotos",
+        "status": "ok",
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy",
+        "project_dir": str(PROJECT_DIR),
     }
 
 
