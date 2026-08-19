@@ -1,7 +1,6 @@
 import cv2
 import numpy as np
 import os
-import gradio as gr
 
 
 class LutWhite:
@@ -46,8 +45,18 @@ class MakeWhiter:
 
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
-default_lut = cv2.imread(os.path.join(base_dir, "lut/lut_origin.png"))
-make_whiter = MakeWhiter(default_lut)
+make_whiter = None
+
+
+def _get_make_whiter():
+    global make_whiter
+    if make_whiter is None:
+        lut_path = os.path.join(base_dir, "lut/lut_origin.png")
+        default_lut = cv2.imread(lut_path)
+        if default_lut is None:
+            raise RuntimeError(f"Whitening LUT not found: {lut_path}")
+        make_whiter = MakeWhiter(default_lut)
+    return make_whiter
 
 
 def make_whitening(image, strength):
@@ -57,9 +66,9 @@ def make_whitening(image, strength):
     bias = strength % 10
 
     for i in range(iteration):
-        image = make_whiter.run(image, 10)
+        image = _get_make_whiter().run(image, 10)
 
-    image = make_whiter.run(image, bias)
+    image = _get_make_whiter().run(image, bias)
 
     return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
@@ -70,22 +79,7 @@ def make_whitening_png(image, strength):
     b, g, r, a = cv2.split(image)
     bgr_image = cv2.merge((b, g, r))
 
-    b_w, g_w, r_w = cv2.split(make_whiter.run(bgr_image, strength))
+    b_w, g_w, r_w = cv2.split(_get_make_whiter().run(bgr_image, strength))
     output_image = cv2.merge((b_w, g_w, r_w, a))
 
     return cv2.cvtColor(output_image, cv2.COLOR_RGBA2BGRA)
-
-
-# 启动Gradio应用
-if __name__ == "__main__":
-    demo = gr.Interface(
-        fn=make_whitening,
-        inputs=[
-            gr.Image(type="pil", image_mode="RGBA", label="Input Image"),
-            gr.Slider(0, 30, step=1, label="Whitening Strength"),
-        ],
-        outputs=gr.Image(type="pil"),
-        title="Image Whitening Demo",
-        description="Upload an image and adjust the whitening strength to see the effect.",
-    )
-    demo.launch()

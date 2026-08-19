@@ -1,0 +1,21 @@
+[Unit]
+Description=ID Photo FastAPI Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/codes/id-photo-back
+Environment="PATH=/home/ubuntu/codes/id-photo-back/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+Environment="CACHE_MODELS_DURING_WORKER=0"
+Environment="ONNX_INTRA_OP_THREADS=2"
+ExecStart=/home/ubuntu/codes/id-photo-back/.venv/bin/uvicorn api_server:app --host 172.18.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

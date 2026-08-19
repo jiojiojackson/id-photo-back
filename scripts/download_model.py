@@ -110,7 +110,8 @@ if __name__ == "__main__":
         "modnet_photographic_portrait_matting",
         # "mnn_hivision_modnet",
         "rmbg-1.4",
-        "birefnet-lite",
+        "birefnet-v1-lite",
+        "retinaface-resnet50",
         "all",
     ]
 

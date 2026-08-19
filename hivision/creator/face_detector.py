@@ -7,12 +7,7 @@ r"""
 @Description:
     人脸检测器
 """
-try:
-    from mtcnnruntime import MTCNN
-except ImportError:
-    raise ImportError(
-        "Please install mtcnn-runtime by running `pip install mtcnn-runtime`"
-    )
+MTCNN = None
 from .context import Context
 from hivision.error import FaceError, APIError
 from hivision.utils import resize_image_to_kb_base64
@@ -35,7 +30,13 @@ def detect_face_mtcnn(ctx: Context, scale: int = 2):
     :param scale: 最大边长缩放比例，原图:缩放图 = 1:scale
     :raise FaceError: 人脸检测错误，多个人脸或者没有人脸
     """
-    global mtcnn
+    global mtcnn, MTCNN
+    if MTCNN is None:
+        try:
+            from mtcnnruntime import MTCNN as MTCNNClass
+        except ImportError as exc:
+            raise RuntimeError("MTCNN support requires the optional mtcnn-runtime package") from exc
+        MTCNN = MTCNNClass
     if mtcnn is None:
         mtcnn = MTCNN()
     image = cv2.resize(

@@ -49,6 +49,16 @@ BIREFNET_V1_LITE_SESS = None
 
 
 def load_onnx_model(checkpoint_path, set_cpu=False):
+    session_options = onnxruntime.SessionOptions()
+    # Do not retain large activation buffers after the matting stage. Otherwise
+    # this arena is added to RetinaFace's allocations in the same process.
+    session_options.enable_cpu_mem_arena = False
+    session_options.enable_mem_pattern = False
+    session_options.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
+    session_options.intra_op_num_threads = max(
+        1, int(os.getenv("ONNX_INTRA_OP_THREADS", "2"))
+    )
+    session_options.inter_op_num_threads = 1
     providers = (
         ["CUDAExecutionProvider", "CPUExecutionProvider"]
         if ONNX_PROVIDER == "CUDAExecutionProvider"
@@ -57,18 +67,24 @@ def load_onnx_model(checkpoint_path, set_cpu=False):
 
     if set_cpu:
         sess = onnxruntime.InferenceSession(
-            checkpoint_path, providers=["CPUExecutionProvider"]
+            checkpoint_path,
+            sess_options=session_options,
+            providers=["CPUExecutionProvider"],
         )
     else:
         try:
-            sess = onnxruntime.InferenceSession(checkpoint_path, providers=providers)
+            sess = onnxruntime.InferenceSession(
+                checkpoint_path, sess_options=session_options, providers=providers
+            )
         except Exception as e:
             if ONNX_DEVICE == "CUDAExecutionProvider":
                 print(f"Failed to load model with CUDAExecutionProvider: {e}")
                 print("Falling back to CPUExecutionProvider")
                 # 尝试使用CPU加载模型
                 sess = onnxruntime.InferenceSession(
-                    checkpoint_path, providers=["CPUExecutionProvider"]
+                    checkpoint_path,
+                    sess_options=session_options,
+                    providers=["CPUExecutionProvider"],
                 )
             else:
                 raise e  # 如果是CPU执行失败，重新抛出异常

@@ -1,5 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
-from fastapi.responses import Response
+from fastapi import FastAPI, HTTPException, Request
 from hivision.creator import IDCreator
 from hivision.creator.human_matting import extract_human_birefnet_lite
 from hivision.creator.face_detector import detect_face_retinaface
@@ -28,7 +27,7 @@ inference_lock = threading.Lock()
 worker_lock = threading.Lock()
 worker_running = False
 
-HEARTBEAT_INTERVAL_SECONDS = 60
+HEARTBEAT_INTERVAL_SECONDS = 30
 REQUEST_TIMEOUT_SECONDS = 30
 DOWNLOAD_TIMEOUT_SECONDS = 60
 UPLOAD_TIMEOUT_SECONDS = 120
@@ -112,16 +111,23 @@ def _clear_worker_model_cache() -> None:
 
 
 def _prepare_worker_models(worker_run_id: str) -> None:
-    """Enter Worker Run model-cache mode without eagerly loading the models.
+    """Choose the model lifecycle for this Worker Run.
 
-    Models remain lazy-loaded by Hivision on the first job. The important
-    invariant is that RUN_MODE stays `beast` for the entire run, so subsequent
-    jobs reuse the same BiRefNet/RetinaFace ONNX sessions.
+    BiRefNet and RetinaFace each own a sizeable ONNX Runtime allocator. Keeping
+    both sessions alive made their arenas accumulate in one process and pushed
+    RSS above 7 GiB. Low-memory mode is therefore the safe default: each model
+    is released after its stage, before the next model is loaded.
+
+    Operators with enough RAM may explicitly opt back into caching with
+    ``CACHE_MODELS_DURING_WORKER=1``.
     """
-    _set_worker_model_cache(True)
+    cache_enabled = os.getenv("CACHE_MODELS_DURING_WORKER", "0").lower() in {
+        "1", "true", "yes", "on",
+    }
+    _set_worker_model_cache(cache_enabled)
     print(
         f"[QueueWorker] model cache enabled run={worker_run_id} "
-        "scope=worker_run reuse=enabled",
+        f"scope=worker_run reuse={'enabled' if cache_enabled else 'disabled'}",
         flush=True,
     )
 
@@ -215,7 +221,9 @@ def _heartbeat_loop(bridge_url: str, worker_credential: str, job_id: str, stop_e
     import requests
 
     url = f"{bridge_url}/heartbeat"
-    while not stop_event.wait(HEARTBEAT_INTERVAL_SECONDS):
+    # Send the first heartbeat immediately. Waiting one full interval here used
+    # to leave 30-60 second inference jobs with no liveness signal at all.
+    while not stop_event.is_set():
         _log_bridge_request("POST", url, worker_run_id, "heartbeat")
         response = None
         try:
@@ -238,9 +246,11 @@ def _heartbeat_loop(bridge_url: str, worker_credential: str, job_id: str, stop_e
         finally:
             if response is not None:
                 response.close()
+        if stop_event.wait(HEARTBEAT_INTERVAL_SECONDS):
+            return
 
 
-def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, max_jobs: int | None) -> None:
+def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, max_jobs: int | None) -> int:
     global worker_running
     processed = 0
     _prepare_worker_models(worker_run_id)
@@ -300,7 +310,7 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
                 finally:
                     finish.close()
                 print(f"[QueueWorker] queue empty, worker finished processed={processed}", flush=True)
-                break
+                return processed
 
             if status != "job" or not payload.get("job"):
                 raise RuntimeError(f"unexpected /next response: {payload}")
@@ -415,8 +425,11 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
                 _release_per_job_memory()
                 _log_process_memory("job_cleanup", worker_run_id)
 
+        return processed
+
     except Exception as exc:
         print(f"[QueueWorker] stopped unexpectedly run={worker_run_id}: {exc}", flush=True)
+        raise
     finally:
         _finish_worker_models(worker_run_id)
         with worker_lock:
@@ -489,13 +502,12 @@ def health():
 
 @app.post("/process-queue")
 def process_queue(payload: dict, request: Request):
-    """Process the queue Worker Run inside this HTTP request.
+    """Start one serial queue worker and acknowledge the wake request quickly.
 
-    This deliberately mirrors the historical `/generate` lifecycle: Lightning
-    keeps the request open while inference/queue work is running, and the
-    request only completes after the Worker Run has finished and its model
-    cleanup has completed. No background queue thread and no process exit are
-    used, so the container can become idle naturally after the response.
+    This deployment is a persistent systemd service. Keeping this HTTP request
+    open for the entire queue made the Vercel/Pangolin caller hit its request
+    duration limit and revoke an otherwise healthy worker credential. The
+    daemon thread is safe here because systemd owns the process lifetime.
     """
     parsed = _process_queue_payload(payload)
 
@@ -512,18 +524,26 @@ def process_queue(payload: dict, request: Request):
             return {"status": "already_running", "mode": "serial", "worker_run_id": parsed["worker_run_id"]}
         worker_running = True
 
-    # Run synchronously as part of the HTTP request. FastAPI executes this
-    # regular `def` handler in its threadpool, so the event loop remains free,
-    # while Lightning still sees one long-lived request for the whole Worker Run.
-    _process_jobs(
-        parsed["bridge_url"],
-        parsed["worker_run_id"],
-        parsed["worker_credential"],
-        parsed["max_jobs"],
+    worker_thread = threading.Thread(
+        target=_process_jobs,
+        args=(
+            parsed["bridge_url"],
+            parsed["worker_run_id"],
+            parsed["worker_credential"],
+            parsed["max_jobs"],
+        ),
+        name=f"queue-worker-{parsed['worker_run_id']}",
+        daemon=True,
     )
+    try:
+        worker_thread.start()
+    except Exception:
+        with worker_lock:
+            worker_running = False
+        raise
 
     return {
-        "status": "completed",
+        "status": "started",
         "mode": "serial",
         "worker_run_id": parsed["worker_run_id"],
         "vercel_origin": parsed["vercel_origin"],
