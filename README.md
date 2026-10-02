@@ -41,9 +41,13 @@ uvicorn api_server:app --host 127.0.0.1 --port 8000
 
 - `GET /`：服务状态
 - `GET /health`：健康检查
-- `POST /process-queue`：同步执行一次队列 Worker Run
+- `POST /process-queue`：立即确认启动，在后台串行执行队列 Worker Run
 
 `/process-queue` 接受 `bridge_url`/`bridgeUrl`、`vercel_origin`/`vercelOrigin`、`worker_run_id`/`workerRunId`、`worker_credential`/`workerCredential`，以及可选的 `max_jobs`/`maxJobs`。同一进程一次只运行一个 Worker Run。
+
+`/health` 返回当前实际运行的 `worker_run_id`。同一 Run 的重复启动请求幂等返回，不同 Run 并发启动返回 409。
+
+保留高清透明 PNG 输出，用户选择的尺寸用于确定照片比例。R2 权限错误、文件不存在以及无效照片不会重复处理；超时、429 和 5xx 等临时故障仍有最多五次尝试，并在重试之间退避。R2 操作日志记录状态码和请求 ID，不记录签名 URL。
 
 ## 检查
 

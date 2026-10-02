@@ -10,6 +10,7 @@ import gc
 import io
 import numpy as np
 import os
+import re
 import threading
 import time
 from urllib.parse import urlparse
@@ -26,6 +27,7 @@ creator.detection_handler = detect_face_retinaface
 inference_lock = threading.Lock()
 worker_lock = threading.Lock()
 worker_running = False
+active_worker_run_id = None
 
 HEARTBEAT_INTERVAL_SECONDS = 30
 REQUEST_TIMEOUT_SECONDS = 30
@@ -196,6 +198,20 @@ def _bridge_headers(worker_credential: str) -> dict[str, str]:
     }
 
 
+def _safe_error(exc: Exception) -> str:
+    # Presigned R2 URLs grant access. Never persist their query strings in the
+    # public job error or in logs when requests raises an HTTPError.
+    return re.sub(r"https?://[^\s'\"]+", "<URL redacted>", str(exc))[:2000]
+
+
+def _retryable_job_error(exc: Exception) -> bool:
+    import requests
+
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        return exc.response.status_code in {408, 429} or exc.response.status_code >= 500
+    return isinstance(exc, (requests.ConnectionError, requests.Timeout))
+
+
 def _log_bridge_request(method: str, url: str, run_id: str, stage: str) -> None:
     """Log the complete Vercel Bridge URL, including hostname, without logging secrets."""
     print(
@@ -251,11 +267,11 @@ def _heartbeat_loop(bridge_url: str, worker_credential: str, job_id: str, stop_e
 
 
 def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, max_jobs: int | None) -> int:
-    global worker_running
+    global worker_running, active_worker_run_id
     processed = 0
-    _prepare_worker_models(worker_run_id)
 
     try:
+        _prepare_worker_models(worker_run_id)
         import requests
 
         bridge_url = bridge_url.rstrip("/")
@@ -328,20 +344,20 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
             heartbeat_thread.start()
 
             try:
-                input_data = None
-                input_response = requests.get(
-                    job["inputUrl"],
-                    timeout=DOWNLOAD_TIMEOUT_SECONDS,
-                )
-                try:
-                    input_response.raise_for_status()
-                    input_data = input_response.content
-                finally:
-                    input_response.close()
-
                 try:
                     output = None
+                    input_data = None
                     try:
+                        input_response = requests.get(
+                            job["inputUrl"],
+                            timeout=DOWNLOAD_TIMEOUT_SECONDS,
+                        )
+                        try:
+                            input_response.raise_for_status()
+                            input_data = input_response.content
+                            print(f"[R2] operation=download status={input_response.status_code} bytes={len(input_data)} request_id={input_response.headers.get('cf-ray', '<none>')}", flush=True)
+                        finally:
+                            input_response.close()
                         output, inference_elapsed = _run_inference(
                             input_data,
                             int(job.get("width", 295)),
@@ -360,6 +376,7 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
                         )
                         try:
                             output_response.raise_for_status()
+                            print(f"[R2] operation=upload status={output_response.status_code} bytes={len(output)} request_id={output_response.headers.get('cf-ray', '<none>')}", flush=True)
                         finally:
                             output_response.close()
                     finally:
@@ -393,6 +410,8 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
 
                 except Exception as exc:
                     elapsed_ms = int((time.perf_counter() - started) * 1000)
+                    retryable = _retryable_job_error(exc)
+                    error_message = _safe_error(exc)
                     fail_url = f"{bridge_url}/fail"
                     _log_bridge_request("POST", fail_url, worker_run_id, "fail")
                     try:
@@ -402,18 +421,28 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
                             json={
                                 "jobId": job_id,
                                 "workerRunId": worker_run_id,
-                                "error": str(exc)[:2000],
+                                "error": error_message,
+                                "retryable": retryable,
                             },
                             timeout=REQUEST_TIMEOUT_SECONDS,
                         )
                         try:
                             failed.raise_for_status()
+                            failure_status = failed.json().get("status")
                         finally:
                             failed.close()
                     except Exception as callback_error:
-                        print(f"[QueueWorker] fail callback failed job={job_id}: {callback_error}", flush=True)
+                        print(f"[QueueWorker] fail callback failed job={job_id}: {_safe_error(callback_error)}", flush=True)
+                        raise
                     processed += 1
-                    print(f"[QueueWorker] failed job={job_id} time={elapsed_ms}ms error={exc}", flush=True)
+                    print(f"[QueueWorker] failed job={job_id} time={elapsed_ms}ms retryable={retryable} error={error_message}", flush=True)
+                    if retryable and failure_status == "queued":
+                        delay = min(5 * 2 ** min(int(job.get("attemptCount", 1)) - 1, 4), 60)
+                        print(f"[QueueWorker] retry backoff job={job_id} seconds={delay}", flush=True)
+                        # End the lease heartbeat before waiting between attempts.
+                        heartbeat_stop.set()
+                        heartbeat_thread.join(timeout=2)
+                        time.sleep(delay)
             finally:
                 heartbeat_stop.set()
                 heartbeat_thread.join(timeout=2)
@@ -425,15 +454,26 @@ def _process_jobs(bridge_url: str, worker_run_id: str, worker_credential: str, m
                 _release_per_job_memory()
                 _log_process_memory("job_cleanup", worker_run_id)
 
+        # A caller can explicitly limit the batch. Completed jobs no longer own
+        # leases, so close this run even when more queued jobs remain.
+        finish = requests.post(
+            finish_url, headers=headers, json={"processed": processed},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        try:
+            finish.raise_for_status()
+        finally:
+            finish.close()
         return processed
 
     except Exception as exc:
-        print(f"[QueueWorker] stopped unexpectedly run={worker_run_id}: {exc}", flush=True)
+        print(f"[QueueWorker] stopped unexpectedly run={worker_run_id}: {_safe_error(exc)}", flush=True)
         raise
     finally:
         _finish_worker_models(worker_run_id)
         with worker_lock:
             worker_running = False
+            active_worker_run_id = None
         print(f"[QueueWorker] stopped run={worker_run_id} processed={processed}", flush=True)
 
 
@@ -494,10 +534,13 @@ def root():
 
 @app.get("/health")
 def health():
-    return {
-        "status": "healthy",
-        "project_dir": str(PROJECT_DIR),
-    }
+    with worker_lock:
+        return {
+            "status": "healthy",
+            "project_dir": str(PROJECT_DIR),
+            "worker_running": worker_running,
+            "worker_run_id": active_worker_run_id,
+        }
 
 
 @app.post("/process-queue")
@@ -518,11 +561,14 @@ def process_queue(payload: dict, request: Request):
         flush=True,
     )
 
-    global worker_running
+    global worker_running, active_worker_run_id
     with worker_lock:
         if worker_running:
-            return {"status": "already_running", "mode": "serial", "worker_run_id": parsed["worker_run_id"]}
+            if active_worker_run_id != parsed["worker_run_id"]:
+                raise HTTPException(status_code=409, detail="Another worker run is already active")
+            return {"status": "already_running", "mode": "serial", "worker_run_id": active_worker_run_id}
         worker_running = True
+        active_worker_run_id = parsed["worker_run_id"]
 
     worker_thread = threading.Thread(
         target=_process_jobs,
@@ -540,6 +586,7 @@ def process_queue(payload: dict, request: Request):
     except Exception:
         with worker_lock:
             worker_running = False
+            active_worker_run_id = None
         raise
 
     return {
