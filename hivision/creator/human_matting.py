@@ -77,7 +77,7 @@ def load_onnx_model(checkpoint_path, set_cpu=False):
                 checkpoint_path, sess_options=session_options, providers=providers
             )
         except Exception as e:
-            if ONNX_DEVICE == "CUDAExecutionProvider":
+            if ONNX_PROVIDER == "CUDAExecutionProvider" and os.getenv("REQUIRE_CUDA") != "1":
                 print(f"Failed to load model with CUDAExecutionProvider: {e}")
                 print("Falling back to CPUExecutionProvider")
                 # 尝试使用CPU加载模型
@@ -89,6 +89,8 @@ def load_onnx_model(checkpoint_path, set_cpu=False):
             else:
                 raise e  # 如果是CPU执行失败，重新抛出异常
 
+    if not set_cpu and os.getenv("REQUIRE_CUDA") == "1" and "CUDAExecutionProvider" not in sess.get_providers():
+        raise RuntimeError("BiRefNet requires CUDA; CPU fallback is disabled")
     return sess
 
 
